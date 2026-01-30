@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
-use tracing::{debug, info, trace, warn};
+use {
+    anyhow::{Result, bail},
+    tracing::{debug, info, trace, warn},
+};
 
-use crate::model::{CompletionResponse, LlmProvider, ToolCall};
-use crate::tool_registry::ToolRegistry;
+use crate::{
+    model::{CompletionResponse, LlmProvider, ToolCall},
+    tool_registry::ToolRegistry,
+};
 
 /// Maximum number of tool-call loop iterations before giving up.
 const MAX_ITERATIONS: usize = 25;
@@ -27,8 +31,15 @@ pub enum RunnerEvent {
     Thinking,
     /// LLM finished thinking (hide the indicator).
     ThinkingDone,
-    ToolCallStart { id: String, name: String },
-    ToolCallEnd { id: String, name: String, success: bool },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallEnd {
+        id: String,
+        name: String,
+        success: bool,
+    },
     TextDelta(String),
     Iteration(usize),
 }
@@ -55,7 +66,10 @@ fn parse_tool_call_from_text(text: &str) -> Option<(ToolCall, Option<String>)> {
 
     let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let tool_name = parsed["tool"].as_str()?.to_string();
-    let arguments = parsed.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+    let arguments = parsed
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     let id = format!("text-{}", uuid::Uuid::new_v4());
 
@@ -74,7 +88,14 @@ fn parse_tool_call_from_text(text: &str) -> Option<(ToolCall, Option<String>)> {
         (false, false) => Some(format!("{before}\n{after}")),
     };
 
-    Some((ToolCall { id, name: tool_name, arguments }, remaining))
+    Some((
+        ToolCall {
+            id,
+            name: tool_name,
+            arguments,
+        },
+        remaining,
+    ))
 }
 
 /// Run the agent loop: send messages to the LLM, execute tool calls, repeat.
@@ -108,7 +129,11 @@ pub async fn run_agent_loop(
     ];
 
     // Only send tool schemas to providers that support them natively.
-    let schemas_for_api = if native_tools { &tool_schemas } else { &vec![] };
+    let schemas_for_api = if native_tools {
+        &tool_schemas
+    } else {
+        &vec![]
+    };
 
     let mut iterations = 0;
     let mut total_tool_calls = 0;
@@ -124,14 +149,19 @@ pub async fn run_agent_loop(
             cb(RunnerEvent::Iteration(iterations));
         }
 
-        info!(iteration = iterations, messages_count = messages.len(), "calling LLM");
+        info!(
+            iteration = iterations,
+            messages_count = messages.len(),
+            "calling LLM"
+        );
         trace!(iteration = iterations, messages = %serde_json::to_string(&messages).unwrap_or_default(), "LLM request messages");
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::Thinking);
         }
 
-        let mut response: CompletionResponse = provider.complete(&messages, schemas_for_api).await?;
+        let mut response: CompletionResponse =
+            provider.complete(&messages, schemas_for_api).await?;
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
@@ -150,17 +180,17 @@ pub async fn run_agent_loop(
         }
 
         // For providers without native tool calling, try parsing tool calls from text.
-        if !native_tools && response.tool_calls.is_empty() {
-            if let Some(ref text) = response.text {
-                if let Some((tc, remaining_text)) = parse_tool_call_from_text(text) {
-                    info!(
-                        tool = %tc.name,
-                        "parsed tool call from text (non-native provider)"
-                    );
-                    response.text = remaining_text;
-                    response.tool_calls = vec![tc];
-                }
-            }
+        if !native_tools
+            && response.tool_calls.is_empty()
+            && let Some(ref text) = response.text
+            && let Some((tc, remaining_text)) = parse_tool_call_from_text(text)
+        {
+            info!(
+                tool = %tc.name,
+                "parsed tool call from text (non-native provider)"
+            );
+            response.text = remaining_text;
+            response.tool_calls = vec![tc];
         }
 
         for tc in &response.tool_calls {
@@ -239,7 +269,7 @@ pub async fn run_agent_loop(
                             });
                         }
                         serde_json::json!({ "result": val })
-                    }
+                    },
                     Err(e) => {
                         warn!(tool = %tc.name, id = %tc.id, error = %e, "tool execution failed");
                         if let Some(cb) = on_event {
@@ -250,7 +280,7 @@ pub async fn run_agent_loop(
                             });
                         }
                         serde_json::json!({ "error": e.to_string() })
-                    }
+                    },
                 }
             } else {
                 warn!(tool = %tc.name, id = %tc.id, "unknown tool requested by LLM");
@@ -283,21 +313,19 @@ pub async fn run_agent_loop(
 }
 
 /// Convenience wrapper matching the old stub signature.
-pub async fn run_agent(
-    _agent_id: &str,
-    _session_key: &str,
-    _message: &str,
-) -> Result<String> {
+pub async fn run_agent(_agent_id: &str, _session_key: &str, _message: &str) -> Result<String> {
     bail!("run_agent requires a configured provider and tool registry; use run_agent_loop instead")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::model::{CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage};
-    use async_trait::async_trait;
-    use std::pin::Pin;
-    use tokio_stream::Stream;
+    use {
+        super::*,
+        crate::model::{CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage},
+        async_trait::async_trait,
+        std::pin::Pin,
+        tokio_stream::Stream,
+    };
 
     // ── parse_tool_call_from_text tests ──────────────────────────────
 
@@ -341,8 +369,14 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for MockProvider {
-        fn name(&self) -> &str { "mock" }
-        fn id(&self) -> &str { "mock-model" }
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "mock-model"
+        }
+
         async fn complete(
             &self,
             _messages: &[serde_json::Value],
@@ -351,9 +385,13 @@ mod tests {
             Ok(CompletionResponse {
                 text: Some(self.response_text.clone()),
                 tool_calls: vec![],
-                usage: Usage { input_tokens: 10, output_tokens: 5 },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
             })
         }
+
         fn stream(
             &self,
             _messages: Vec<serde_json::Value>,
@@ -369,15 +407,26 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for ToolCallingProvider {
-        fn name(&self) -> &str { "mock" }
-        fn id(&self) -> &str { "mock-model" }
-        fn supports_tools(&self) -> bool { true }
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "mock-model"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
         async fn complete(
             &self,
             _messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
         ) -> Result<CompletionResponse> {
-            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count == 0 {
                 Ok(CompletionResponse {
                     text: None,
@@ -386,16 +435,23 @@ mod tests {
                         name: "echo_tool".into(),
                         arguments: serde_json::json!({"text": "hi"}),
                     }],
-                    usage: Usage { input_tokens: 10, output_tokens: 5 },
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
                 })
             } else {
                 Ok(CompletionResponse {
                     text: Some("Done!".into()),
                     tool_calls: vec![],
-                    usage: Usage { input_tokens: 20, output_tokens: 10 },
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
                 })
             }
         }
+
         fn stream(
             &self,
             _messages: Vec<serde_json::Value>,
@@ -411,15 +467,26 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for TextToolCallingProvider {
-        fn name(&self) -> &str { "mock-no-native" }
-        fn id(&self) -> &str { "mock-no-native" }
-        fn supports_tools(&self) -> bool { false }
+        fn name(&self) -> &str {
+            "mock-no-native"
+        }
+
+        fn id(&self) -> &str {
+            "mock-no-native"
+        }
+
+        fn supports_tools(&self) -> bool {
+            false
+        }
+
         async fn complete(
             &self,
             messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
         ) -> Result<CompletionResponse> {
-            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count == 0 {
                 // Simulate an LLM emitting a tool_call block in text.
                 Ok(CompletionResponse {
@@ -429,12 +496,8 @@ mod tests {
                 })
             } else {
                 // Verify tool result was fed back.
-                let tool_msg = messages.iter().find(|m| {
-                    m["role"].as_str() == Some("tool")
-                });
-                let tool_content = tool_msg
-                    .and_then(|m| m["content"].as_str())
-                    .unwrap_or("");
+                let tool_msg = messages.iter().find(|m| m["role"].as_str() == Some("tool"));
+                let tool_content = tool_msg.and_then(|m| m["content"].as_str()).unwrap_or("");
                 assert!(
                     tool_content.contains("hello"),
                     "tool result should contain 'hello', got: {tool_content}"
@@ -442,10 +505,14 @@ mod tests {
                 Ok(CompletionResponse {
                     text: Some("The command output: hello".into()),
                     tool_calls: vec![],
-                    usage: Usage { input_tokens: 30, output_tokens: 10 },
+                    usage: Usage {
+                        input_tokens: 30,
+                        output_tokens: 10,
+                    },
                 })
             }
         }
+
         fn stream(
             &self,
             _messages: Vec<serde_json::Value>,
@@ -459,11 +526,18 @@ mod tests {
 
     #[async_trait]
     impl crate::tool_registry::AgentTool for EchoTool {
-        fn name(&self) -> &str { "echo_tool" }
-        fn description(&self) -> &str { "Echoes input" }
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes input"
+        }
+
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}})
         }
+
         async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value> {
             Ok(params)
         }
@@ -474,8 +548,14 @@ mod tests {
 
     #[async_trait]
     impl crate::tool_registry::AgentTool for TestExecTool {
-        fn name(&self) -> &str { "exec" }
-        fn description(&self) -> &str { "Execute a shell command" }
+        fn name(&self) -> &str {
+            "exec"
+        }
+
+        fn description(&self) -> &str {
+            "Execute a shell command"
+        }
+
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({
                 "type": "object",
@@ -485,6 +565,7 @@ mod tests {
                 "required": ["command"]
             })
         }
+
         async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value> {
             let command = params["command"].as_str().unwrap_or("echo noop");
             let output = tokio::process::Command::new("sh")
@@ -508,11 +589,9 @@ mod tests {
             response_text: "Hello!".into(),
         });
         let tools = ToolRegistry::new();
-        let result = run_agent_loop(
-            provider, &tools, "You are a test bot.", "Hi", None,
-        )
-        .await
-        .unwrap();
+        let result = run_agent_loop(provider, &tools, "You are a test bot.", "Hi", None)
+            .await
+            .unwrap();
         assert_eq!(result.text, "Hello!");
         assert_eq!(result.iterations, 1);
         assert_eq!(result.tool_calls_made, 0);
@@ -527,7 +606,11 @@ mod tests {
         tools.register(Box::new(EchoTool));
 
         let result = run_agent_loop(
-            provider, &tools, "You are a test bot.", "Use the tool", None,
+            provider,
+            &tools,
+            "You are a test bot.",
+            "Use the tool",
+            None,
         )
         .await
         .unwrap();
@@ -544,15 +627,26 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for ExecSimulatingProvider {
-        fn name(&self) -> &str { "mock" }
-        fn id(&self) -> &str { "mock-model" }
-        fn supports_tools(&self) -> bool { true }
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "mock-model"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
         async fn complete(
             &self,
             messages: &[serde_json::Value],
             _tools: &[serde_json::Value],
         ) -> Result<CompletionResponse> {
-            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count == 0 {
                 Ok(CompletionResponse {
                     text: None,
@@ -561,7 +655,10 @@ mod tests {
                         name: "exec".into(),
                         arguments: serde_json::json!({"command": "echo hello"}),
                     }],
-                    usage: Usage { input_tokens: 10, output_tokens: 5 },
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
                 })
             } else {
                 let tool_msg = messages.iter().find(|m| m["role"].as_str() == Some("tool"));
@@ -573,10 +670,14 @@ mod tests {
                 Ok(CompletionResponse {
                     text: Some(format!("The output was: {}", stdout.trim())),
                     tool_calls: vec![],
-                    usage: Usage { input_tokens: 20, output_tokens: 10 },
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
                 })
             }
         }
+
         fn stream(
             &self,
             _messages: Vec<serde_json::Value>,
@@ -601,7 +702,11 @@ mod tests {
         });
 
         let result = run_agent_loop(
-            provider, &tools, "You are a test bot.", "Run echo hello", Some(&on_event),
+            provider,
+            &tools,
+            "You are a test bot.",
+            "Run echo hello",
+            Some(&on_event),
         )
         .await
         .unwrap();
@@ -611,17 +716,23 @@ mod tests {
         assert_eq!(result.tool_calls_made, 1);
 
         let evts = events.lock().unwrap();
-        let has = |name: &str| evts.iter().any(|e| matches!(
-            (e, name),
-            (RunnerEvent::Thinking, "thinking") |
-            (RunnerEvent::ToolCallStart { .. }, "tool_call_start") |
-            (RunnerEvent::ToolCallEnd { .. }, "tool_call_end")
-        ));
+        let has = |name: &str| {
+            evts.iter().any(|e| {
+                matches!(
+                    (e, name),
+                    (RunnerEvent::Thinking, "thinking")
+                        | (RunnerEvent::ToolCallStart { .. }, "tool_call_start")
+                        | (RunnerEvent::ToolCallEnd { .. }, "tool_call_end")
+                )
+            })
+        };
         assert!(has("tool_call_start"));
         assert!(has("tool_call_end"));
         assert!(has("thinking"));
 
-        let tool_end = evts.iter().find(|e| matches!(e, RunnerEvent::ToolCallEnd { .. }));
+        let tool_end = evts
+            .iter()
+            .find(|e| matches!(e, RunnerEvent::ToolCallEnd { .. }));
         if let Some(RunnerEvent::ToolCallEnd { success, name, .. }) = tool_end {
             assert!(success, "exec tool should succeed");
             assert_eq!(name, "exec");
@@ -645,7 +756,11 @@ mod tests {
         });
 
         let result = run_agent_loop(
-            provider, &tools, "You are a test bot.", "Run echo hello", Some(&on_event),
+            provider,
+            &tools,
+            "You are a test bot.",
+            "Run echo hello",
+            Some(&on_event),
         )
         .await
         .unwrap();
@@ -656,7 +771,13 @@ mod tests {
 
         // Verify tool events were emitted even for text-parsed calls.
         let evts = events.lock().unwrap();
-        assert!(evts.iter().any(|e| matches!(e, RunnerEvent::ToolCallStart { .. })));
-        assert!(evts.iter().any(|e| matches!(e, RunnerEvent::ToolCallEnd { success: true, .. })));
+        assert!(
+            evts.iter()
+                .any(|e| matches!(e, RunnerEvent::ToolCallStart { .. }))
+        );
+        assert!(
+            evts.iter()
+                .any(|e| matches!(e, RunnerEvent::ToolCallEnd { success: true, .. }))
+        );
     }
 }

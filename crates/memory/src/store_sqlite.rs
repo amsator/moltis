@@ -2,9 +2,11 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use crate::schema::{ChunkRow, FileRow};
-use crate::search::SearchResult;
-use crate::store::MemoryStore;
+use crate::{
+    schema::{ChunkRow, FileRow},
+    search::SearchResult,
+    store::MemoryStore,
+};
 
 pub struct SqliteMemoryStore {
     pool: SqlitePool,
@@ -147,9 +149,33 @@ impl MemoryStore for SqliteMemoryStore {
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)| {
-                ChunkRow { id, path, source, start_line, end_line, hash, model, text, embedding, updated_at }
-            })
+            .map(
+                |(
+                    id,
+                    path,
+                    source,
+                    start_line,
+                    end_line,
+                    hash,
+                    model,
+                    text,
+                    embedding,
+                    updated_at,
+                )| {
+                    ChunkRow {
+                        id,
+                        path,
+                        source,
+                        start_line,
+                        end_line,
+                        hash,
+                        model,
+                        text,
+                        embedding,
+                        updated_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -169,9 +195,22 @@ impl MemoryStore for SqliteMemoryStore {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|(id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)| {
-            ChunkRow { id, path, source, start_line, end_line, hash, model, text, embedding, updated_at }
-        }))
+        Ok(row.map(
+            |(id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)| {
+                ChunkRow {
+                    id,
+                    path,
+                    source,
+                    start_line,
+                    end_line,
+                    hash,
+                    model,
+                    text,
+                    embedding,
+                    updated_at,
+                }
+            },
+        ))
     }
 
     async fn get_cached_embedding(
@@ -248,16 +287,16 @@ impl MemoryStore for SqliteMemoryStore {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit);
         Ok(scored)
     }
 
-    async fn keyword_search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<SearchResult>> {
+    async fn keyword_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
         let rows: Vec<(String, String, String, i64, i64, f64)> = sqlx::query_as(
             "SELECT c.id, c.path, c.source, c.start_line, c.end_line, rank
              FROM chunks_fts f
@@ -301,8 +340,7 @@ impl MemoryStore for SqliteMemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::schema::run_migrations;
+    use {super::*, crate::schema::run_migrations};
 
     async fn setup() -> SqliteMemoryStore {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -322,7 +360,11 @@ mod tests {
         };
         store.upsert_file(&file).await.unwrap();
 
-        let got = store.get_file("memory/2024-01-01.md").await.unwrap().unwrap();
+        let got = store
+            .get_file("memory/2024-01-01.md")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.hash, "abc123");
 
         assert!(store.get_file("nonexistent").await.unwrap().is_none());
@@ -331,7 +373,13 @@ mod tests {
         assert_eq!(files.len(), 1);
 
         store.delete_file("memory/2024-01-01.md").await.unwrap();
-        assert!(store.get_file("memory/2024-01-01.md").await.unwrap().is_none());
+        assert!(
+            store
+                .get_file("memory/2024-01-01.md")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -369,7 +417,13 @@ mod tests {
         assert_eq!(got.start_line, 1);
 
         store.delete_chunks_for_file("test.md").await.unwrap();
-        assert!(store.get_chunks_for_file("test.md").await.unwrap().is_empty());
+        assert!(
+            store
+                .get_chunks_for_file("test.md")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

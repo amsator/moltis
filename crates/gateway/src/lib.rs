@@ -12,8 +12,8 @@
 
 pub mod approval;
 pub mod auth;
-pub mod chat;
 pub mod broadcast;
+pub mod chat;
 pub mod methods;
 pub mod nodes;
 pub mod pairing;

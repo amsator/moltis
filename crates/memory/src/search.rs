@@ -1,8 +1,7 @@
 /// Hybrid search: combine vector similarity and keyword/FTS results.
 use std::collections::HashMap;
 
-use crate::embeddings::EmbeddingProvider;
-use crate::store::MemoryStore;
+use crate::{embeddings::EmbeddingProvider, store::MemoryStore};
 
 /// A search result with metadata.
 #[derive(Debug, Clone)]
@@ -31,7 +30,12 @@ pub async fn hybrid_search(
     let vector_results = store.vector_search(&query_embedding, fetch_limit).await?;
     let keyword_results = store.keyword_search(query, fetch_limit).await?;
 
-    let merged = merge_results(&vector_results, &keyword_results, vector_weight, keyword_weight);
+    let merged = merge_results(
+        &vector_results,
+        &keyword_results,
+        vector_weight,
+        keyword_weight,
+    );
 
     let mut final_results: Vec<SearchResult> = merged.into_iter().take(limit).collect();
 
@@ -57,16 +61,12 @@ fn merge_results(
     let mut scores: HashMap<String, (f32, SearchResult)> = HashMap::new();
 
     for r in vector {
-        let entry = scores
-            .entry(r.chunk_id.clone())
-            .or_insert((0.0, r.clone()));
+        let entry = scores.entry(r.chunk_id.clone()).or_insert((0.0, r.clone()));
         entry.0 += r.score * vector_weight;
     }
 
     for r in keyword {
-        let entry = scores
-            .entry(r.chunk_id.clone())
-            .or_insert((0.0, r.clone()));
+        let entry = scores.entry(r.chunk_id.clone()).or_insert((0.0, r.clone()));
         entry.0 += r.score * keyword_weight;
     }
 
@@ -78,7 +78,11 @@ fn merge_results(
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 

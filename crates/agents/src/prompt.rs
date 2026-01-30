@@ -19,8 +19,10 @@ pub fn build_system_prompt(tools: &ToolRegistry, native_tools: bool) -> String {
             let name = schema["name"].as_str().unwrap_or("unknown");
             let desc = schema["description"].as_str().unwrap_or("");
             let params = &schema["parameters"];
-            prompt.push_str(&format!("### {name}\n{desc}\n\nParameters:\n```json\n{}\n```\n\n",
-                serde_json::to_string_pretty(params).unwrap_or_default()));
+            prompt.push_str(&format!(
+                "### {name}\n{desc}\n\nParameters:\n```json\n{}\n```\n\n",
+                serde_json::to_string_pretty(params).unwrap_or_default()
+            ));
         }
     }
 
@@ -67,11 +69,18 @@ mod tests {
         struct Dummy;
         #[async_trait::async_trait]
         impl crate::tool_registry::AgentTool for Dummy {
-            fn name(&self) -> &str { "test" }
-            fn description(&self) -> &str { "A test tool" }
+            fn name(&self) -> &str {
+                "test"
+            }
+
+            fn description(&self) -> &str {
+                "A test tool"
+            }
+
             fn parameters_schema(&self) -> serde_json::Value {
                 serde_json::json!({"type": "object", "properties": {}})
             }
+
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<serde_json::Value> {
                 Ok(serde_json::json!({}))
             }

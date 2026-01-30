@@ -2,16 +2,18 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use serde_json::Value;
-use tracing::info;
+use {async_trait::async_trait, serde_json::Value, tracing::info};
 
-use moltis_tools::approval::{ApprovalDecision, ApprovalManager};
-use moltis_tools::exec::ApprovalBroadcaster;
+use moltis_tools::{
+    approval::{ApprovalDecision, ApprovalManager},
+    exec::ApprovalBroadcaster,
+};
 
-use crate::broadcast::{broadcast, BroadcastOpts};
-use crate::services::{ExecApprovalService, ServiceResult};
-use crate::state::GatewayState;
+use crate::{
+    broadcast::{BroadcastOpts, broadcast},
+    services::{ExecApprovalService, ServiceResult},
+    state::GatewayState,
+};
 
 /// Live approval service backed by an `ApprovalManager`.
 pub struct LiveExecApprovalService {

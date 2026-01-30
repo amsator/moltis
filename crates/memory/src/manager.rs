@@ -1,16 +1,20 @@
 /// Memory manager: orchestrates file sync, chunking, embedding, and search.
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
-use walkdir::WalkDir;
+use {
+    sha2::{Digest, Sha256},
+    tracing::{debug, info, warn},
+    walkdir::WalkDir,
+};
 
-use crate::chunker::chunk_markdown;
-use crate::config::MemoryConfig;
-use crate::embeddings::EmbeddingProvider;
-use crate::schema::{ChunkRow, FileRow};
-use crate::search::{self, SearchResult};
-use crate::store::MemoryStore;
+use crate::{
+    chunker::chunk_markdown,
+    config::MemoryConfig,
+    embeddings::EmbeddingProvider,
+    schema::{ChunkRow, FileRow},
+    search::{self, SearchResult},
+    store::MemoryStore,
+};
 
 pub struct MemoryManager {
     config: MemoryConfig,
@@ -71,11 +75,11 @@ impl MemoryManager {
                         } else {
                             report.files_unchanged += 1;
                         }
-                    }
+                    },
                     Err(e) => {
                         warn!(path = %path_str, error = %e, "failed to sync file");
                         report.errors += 1;
-                    }
+                    },
                 }
             }
         }
@@ -131,7 +135,8 @@ impl MemoryManager {
         self.store.upsert_file(&file_row).await?;
 
         // Chunk the content
-        let raw_chunks = chunk_markdown(&content, self.config.chunk_size, self.config.chunk_overlap);
+        let raw_chunks =
+            chunk_markdown(&content, self.config.chunk_size, self.config.chunk_overlap);
 
         // Delete old chunks
         self.store.delete_chunks_for_file(path_str).await?;
@@ -228,12 +233,13 @@ fn chrono_now() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::schema::run_migrations;
-    use crate::store_sqlite::SqliteMemoryStore;
-    use async_trait::async_trait;
-    use std::io::Write;
-    use tempfile::TempDir;
+    use {
+        super::*,
+        crate::{schema::run_migrations, store_sqlite::SqliteMemoryStore},
+        async_trait::async_trait,
+        std::io::Write,
+        tempfile::TempDir,
+    };
 
     /// Mock embedding provider that produces deterministic vectors from content.
     ///
@@ -250,7 +256,13 @@ mod tests {
         let lower = text.to_lowercase();
         KEYWORDS
             .iter()
-            .map(|kw| if lower.contains(kw) { 1.0 } else { 0.0 })
+            .map(|kw| {
+                if lower.contains(kw) {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
             .collect()
     }
 
@@ -391,7 +403,10 @@ mod tests {
 
         // Keyword search bypasses embeddings—FTS5 MATCH query
         let results = manager.search("programming", 5).await.unwrap();
-        assert!(!results.is_empty(), "keyword search should find 'programming'");
+        assert!(
+            !results.is_empty(),
+            "keyword search should find 'programming'"
+        );
         assert!(
             results[0].text.contains("programming"),
             "top result should contain the search term"
@@ -485,7 +500,10 @@ mod tests {
 
         // Search should still return results
         let results = manager.search("database", 10).await.unwrap();
-        assert!(!results.is_empty(), "search across 50 files should return results");
+        assert!(
+            !results.is_empty(),
+            "search across 50 files should return results"
+        );
 
         // All top results should be about database
         for r in &results {

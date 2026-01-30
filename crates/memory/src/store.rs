@@ -1,8 +1,10 @@
 /// Storage abstraction for memory files, chunks, and embedding cache.
 use async_trait::async_trait;
 
-use crate::schema::{ChunkRow, FileRow};
-use crate::search::SearchResult;
+use crate::{
+    schema::{ChunkRow, FileRow},
+    search::SearchResult,
+};
 
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -42,9 +44,5 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>>;
 
-    async fn keyword_search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<SearchResult>>;
+    async fn keyword_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>>;
 }

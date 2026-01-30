@@ -1,9 +1,7 @@
 /// Agent tools for memory search and retrieval.
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use moltis_agents::tool_registry::AgentTool;
-use serde_json::json;
+use {async_trait::async_trait, moltis_agents::tool_registry::AgentTool, serde_json::json};
 
 use crate::manager::MemoryManager;
 
@@ -131,13 +129,15 @@ impl AgentTool for MemoryGetTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::MemoryConfig;
-    use crate::embeddings::EmbeddingProvider;
-    use crate::schema::run_migrations;
-    use crate::store_sqlite::SqliteMemoryStore;
-    use sqlx::SqlitePool;
-    use tempfile::TempDir;
+    use {
+        super::*,
+        crate::{
+            config::MemoryConfig, embeddings::EmbeddingProvider, schema::run_migrations,
+            store_sqlite::SqliteMemoryStore,
+        },
+        sqlx::SqlitePool,
+        tempfile::TempDir,
+    };
 
     /// Same keyword-based mock embedder used in manager tests.
     const KEYWORDS: [&str; 8] = [
@@ -152,7 +152,13 @@ mod tests {
             let lower = text.to_lowercase();
             Ok(KEYWORDS
                 .iter()
-                .map(|kw| if lower.contains(kw) { 1.0 } else { 0.0 })
+                .map(|kw| {
+                    if lower.contains(kw) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
                 .collect())
         }
 
@@ -197,7 +203,12 @@ mod tests {
         assert_eq!(tool.name(), "memory_search");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["query"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("query")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("query"))
+        );
     }
 
     #[test]
@@ -208,7 +219,12 @@ mod tests {
         assert_eq!(tool.name(), "memory_get");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["chunk_id"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("chunk_id")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("chunk_id"))
+        );
     }
 
     /// Execute memory_search via the tool interface and verify JSON output structure.

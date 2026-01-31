@@ -186,10 +186,26 @@ impl ChatService for LiveChatService {
                                     let project: Option<moltis_projects::Project> =
                                         serde_json::from_value(val.clone()).ok();
                                     if let Some(p) = project {
+                                        // Resolve worktree dir from session metadata.
+                                        let worktree_dir = self
+                                            .session_metadata
+                                            .get(&session_key)
+                                            .await
+                                            .and_then(|e| e.worktree_branch)
+                                            .and_then(|_| {
+                                                let wt_path = std::path::Path::new(dir)
+                                                    .join(".moltis-worktrees")
+                                                    .join(&session_key);
+                                                if wt_path.exists() {
+                                                    Some(wt_path)
+                                                } else {
+                                                    None
+                                                }
+                                            });
                                         let ctx = moltis_projects::ProjectContext {
                                             project: p,
                                             context_files: files,
-                                            worktree_dir: None,
+                                            worktree_dir,
                                         };
                                         Some(ctx.to_prompt_section())
                                     } else {

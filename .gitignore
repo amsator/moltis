@@ -1,4 +1,5 @@
 /target
+prompts
 .envrc
 .env
 .env.*

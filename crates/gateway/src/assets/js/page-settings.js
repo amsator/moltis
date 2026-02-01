@@ -48,6 +48,11 @@ var sections = [
 		label: "Security",
 		icon: html`<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" width="16" height="16"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"/></svg>`,
 	},
+	{
+		id: "network",
+		label: "Network",
+		icon: html`<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" width="16" height="16"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 0 0 8.716-6.747M12 21a9.004 9.004 0 0 1-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 0 1 7.843 4.582M12 3a8.997 8.997 0 0 0-7.843 4.582m15.686 0A11.953 11.953 0 0 1 12 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0 1 21 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0 1 12 16.5a17.92 17.92 0 0 1-8.716-2.247m0 0A9.015 9.015 0 0 1 3 12c0-1.605.42-3.113 1.157-4.418"/></svg>`,
+	},
 ];
 
 function SettingsSidebar() {
@@ -835,6 +840,145 @@ function bufToB64(buf) {
 
 // ── Main layout ──────────────────────────────────────────────
 
+// ── Network section ──────────────────────────────────────────
+
+function NetworkSection() {
+	var [networkPolicy, setNetworkPolicy] = useState(null);
+	var [domains, setDomains] = useState([]);
+	var [newDomain, setNewDomain] = useState("");
+	var [networkLoading, setNetworkLoading] = useState(true);
+
+	function fetchNetworkPolicy() {
+		sendRpc("sandbox.network_policy.get", {}).then((res) => {
+			if (res?.ok) {
+				setNetworkPolicy(res.payload.policy);
+				setDomains(res.payload.trusted_domains || []);
+			}
+			setNetworkLoading(false);
+		});
+	}
+
+	useEffect(() => {
+		fetchNetworkPolicy();
+	}, []);
+
+	function addDomain() {
+		var d = newDomain.trim();
+		if (!d) return;
+		sendRpc("sandbox.trusted_domain.add", { domain: d }).then((res) => {
+			if (res?.ok) {
+				setDomains([...domains, d]);
+				setNewDomain("");
+			}
+		});
+	}
+
+	function removeDomain(domain) {
+		sendRpc("sandbox.trusted_domain.remove", { domain }).then((res) => {
+			if (res?.ok) {
+				setDomains(domains.filter((d) => d !== domain));
+			}
+		});
+	}
+
+	if (networkLoading) {
+		return html`<div class="settings-content"><p>Loading...</p></div>`;
+	}
+
+	return html`<div class="settings-content">
+		<div class="settings-section">
+			<h2>Sandbox Network Policy</h2>
+			<p class="text-muted">Controls how sandboxed containers access the network.</p>
+
+			<div class="settings-field" style="margin-top:1rem">
+				<label class="settings-label">Policy</label>
+				<div style="display:flex;flex-direction:column;gap:0.5rem">
+					<label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+						<input type="radio" name="network-policy" value="blocked"
+							checked=${networkPolicy === "blocked"}
+							disabled />
+						<strong>Blocked</strong>
+						<span class="text-muted">- No network access (--network=none)</span>
+					</label>
+					<label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+						<input type="radio" name="network-policy" value="trusted"
+							checked=${networkPolicy === "trusted"}
+							disabled />
+						<strong>Trusted</strong>
+						<span class="text-muted">- Proxy-filtered access to allowed domains</span>
+					</label>
+					<label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
+						<input type="radio" name="network-policy" value="open"
+							checked=${networkPolicy === "open"}
+							disabled />
+						<strong>Open</strong>
+						<span class="text-muted">- Unrestricted network access</span>
+					</label>
+				</div>
+				<p class="text-muted" style="margin-top:0.5rem;font-size:0.85rem">
+					Network policy is set in the config file. UI changes coming soon.
+				</p>
+			</div>
+
+			${
+				networkPolicy === "open"
+					? html`
+				<div class="alert alert-warning" style="margin-top:1rem">
+					Sandbox containers have unrestricted network access. Consider using
+					"trusted" mode for better security.
+				</div>
+			`
+					: null
+			}
+		</div>
+
+		${
+			networkPolicy === "trusted"
+				? html`
+			<div class="settings-section" style="margin-top:2rem">
+				<h2>Trusted Domains</h2>
+				<p class="text-muted">
+					Domains that sandbox containers can access. Unlisted domains trigger an approval prompt.
+				</p>
+
+				<div style="margin-top:1rem">
+					${
+						domains.length > 0
+							? html`
+						<div style="display:flex;flex-direction:column;gap:0.25rem;margin-bottom:1rem">
+							${domains.map(
+								(d) => html`
+								<div style="display:flex;align-items:center;justify-content:space-between;padding:0.5rem 0.75rem;background:var(--bg-secondary);border-radius:6px">
+									<code>${d}</code>
+									<button class="btn-text" onClick=${() => removeDomain(d)}>Remove</button>
+								</div>
+							`,
+							)}
+						</div>
+					`
+							: html`<p class="text-muted">No trusted domains configured.</p>`
+					}
+
+					<div style="display:flex;gap:0.5rem;margin-top:0.5rem">
+						<input
+							type="text"
+							class="input"
+							placeholder="e.g. github.com or *.npmjs.org"
+							value=${newDomain}
+							onInput=${(e) => setNewDomain(e.target.value)}
+							onKeyDown=${(e) => e.key === "Enter" && addDomain()}
+							style="flex:1"
+						/>
+						<button class="btn btn-primary" onClick=${addDomain}>Add</button>
+					</div>
+				</div>
+			</div>
+		`
+				: null
+		}
+	</div>`;
+}
+
 function SettingsPage() {
 	useEffect(() => {
 		fetchIdentity();
@@ -846,6 +990,7 @@ function SettingsPage() {
 		<${SettingsSidebar} />
 		${section === "identity" ? html`<${IdentitySection} />` : null}
 		${section === "security" ? html`<${SecuritySection} />` : null}
+		${section === "network" ? html`<${NetworkSection} />` : null}
 	</div>`;
 }
 

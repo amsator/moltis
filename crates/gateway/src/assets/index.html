@@ -201,6 +201,21 @@
   </div>
 </template>
 
+<template id="tpl-domain-approval-card">
+  <div class="msg approval-card domain-approval-card">
+    <div class="approval-label">Sandbox wants to connect to:</div>
+    <code class="domain-approval-domain"></code>
+    <div class="approval-btns">
+      <button class="approval-btn approval-allow domain-approval-allow">Allow</button>
+      <button class="approval-btn approval-deny domain-approval-deny">Deny</button>
+    </div>
+    <div class="approval-countdown"></div>
+  </div>
+</template>
+
+<!-- Domain approval toast (shown via JS when network.domain.requested event arrives) -->
+<div id="domain-approval-toast" style="display:none"></div>
+
 <template id="tpl-session-item">
   <div class="session-item">
     <div class="session-info">

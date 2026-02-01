@@ -8,7 +8,9 @@
 
 pub mod approval;
 pub mod cron_tool;
+pub mod domain_approval;
 pub mod exec;
 pub mod image_cache;
+pub mod network_proxy;
 pub mod policy;
 pub mod sandbox;

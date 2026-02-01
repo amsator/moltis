@@ -73,6 +73,8 @@ const READ_METHODS: &[&str] = &[
     "chat.context",
     "providers.available",
     "providers.oauth.status",
+    "sandbox.network_policy.get",
+    "sandbox.trusted_domains.list",
 ];
 
 const WRITE_METHODS: &[&str] = &[
@@ -116,6 +118,9 @@ const WRITE_METHODS: &[&str] = &[
     "plugins.repos.remove",
     "plugins.skill.enable",
     "plugins.skill.disable",
+    "sandbox.trusted_domain.add",
+    "sandbox.trusted_domain.remove",
+    "sandbox.domain_approval.resolve",
 ];
 
 const APPROVAL_METHODS: &[&str] = &["exec.approval.request", "exec.approval.resolve"];
@@ -2186,6 +2191,122 @@ impl MethodRegistry {
                         .resolve(ctx.params.clone())
                         .await
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+
+        // Network / domain approval
+        self.register(
+            "sandbox.network_policy.get",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    let router = ctx.state.sandbox_router.as_ref().ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "sandbox not configured")
+                    })?;
+                    let cfg = router.config();
+                    let policy = match cfg.network {
+                        moltis_tools::sandbox::NetworkPolicy::Blocked => "blocked",
+                        moltis_tools::sandbox::NetworkPolicy::Trusted => "trusted",
+                        moltis_tools::sandbox::NetworkPolicy::Open => "open",
+                    };
+                    Ok(serde_json::json!({
+                        "policy": policy,
+                        "trusted_domains": cfg.trusted_domains,
+                    }))
+                })
+            }),
+        );
+        self.register(
+            "sandbox.trusted_domains.list",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    let mgr = ctx.state.domain_approval.as_ref().ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "trusted network not configured")
+                    })?;
+                    let session = ctx
+                        .params
+                        .get("session")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default");
+                    let domains = mgr.list_trusted_domains(session).await;
+                    Ok(serde_json::json!({ "domains": domains }))
+                })
+            }),
+        );
+        self.register(
+            "sandbox.trusted_domain.add",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    let mgr = ctx.state.domain_approval.as_ref().ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "trusted network not configured")
+                    })?;
+                    let domain = ctx
+                        .params
+                        .get("domain")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::INVALID_REQUEST, "missing domain")
+                        })?;
+                    let session = ctx
+                        .params
+                        .get("session")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default");
+                    mgr.add_trusted_domain(session, domain).await;
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            }),
+        );
+        self.register(
+            "sandbox.trusted_domain.remove",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    let mgr = ctx.state.domain_approval.as_ref().ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "trusted network not configured")
+                    })?;
+                    let domain = ctx
+                        .params
+                        .get("domain")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::INVALID_REQUEST, "missing domain")
+                        })?;
+                    let session = ctx
+                        .params
+                        .get("session")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default");
+                    mgr.remove_trusted_domain(session, domain).await;
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            }),
+        );
+        self.register(
+            "sandbox.domain_approval.resolve",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    let mgr = ctx.state.domain_approval.as_ref().ok_or_else(|| {
+                        ErrorShape::new(error_codes::UNAVAILABLE, "trusted network not configured")
+                    })?;
+                    let id = ctx
+                        .params
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ErrorShape::new(error_codes::INVALID_REQUEST, "missing id")
+                        })?;
+                    let approved = ctx
+                        .params
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let decision = if approved {
+                        moltis_tools::domain_approval::DomainDecision::Approved
+                    } else {
+                        moltis_tools::domain_approval::DomainDecision::Denied
+                    };
+                    mgr.resolve(id, decision).await;
+                    Ok(serde_json::json!({ "ok": true }))
                 })
             }),
         );

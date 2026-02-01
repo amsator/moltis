@@ -14,6 +14,8 @@ fn event_scope_guards() -> HashMap<&'static str, &'static [&'static str]> {
     let mut m = HashMap::new();
     m.insert("exec.approval.requested", [scopes::APPROVALS].as_slice());
     m.insert("exec.approval.resolved", [scopes::APPROVALS].as_slice());
+    m.insert("network.domain.requested", [scopes::APPROVALS].as_slice());
+    m.insert("network.domain.resolved", [scopes::APPROVALS].as_slice());
     m.insert("device.pair.requested", [scopes::PAIRING].as_slice());
     m.insert("device.pair.resolved", [scopes::PAIRING].as_slice());
     m.insert("node.pair.requested", [scopes::PAIRING].as_slice());

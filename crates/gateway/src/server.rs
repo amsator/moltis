@@ -397,7 +397,18 @@ pub async fn start_gateway(
         },
         image: config.tools.exec.sandbox.image.clone(),
         container_prefix: config.tools.exec.sandbox.container_prefix.clone(),
-        no_network: config.tools.exec.sandbox.no_network,
+        network: match &config.tools.exec.sandbox.network {
+            moltis_config::schema::NetworkPolicy::Blocked => {
+                moltis_tools::sandbox::NetworkPolicy::Blocked
+            },
+            moltis_config::schema::NetworkPolicy::Trusted => {
+                moltis_tools::sandbox::NetworkPolicy::Trusted
+            },
+            moltis_config::schema::NetworkPolicy::Open => {
+                moltis_tools::sandbox::NetworkPolicy::Open
+            },
+        },
+        trusted_domains: config.tools.exec.sandbox.trusted_domains.clone(),
         backend: config.tools.exec.sandbox.backend.clone(),
         resource_limits: moltis_tools::sandbox::ResourceLimits {
             memory_limit: config
@@ -411,6 +422,8 @@ pub async fn start_gateway(
             pids_max: config.tools.exec.sandbox.resource_limits.pids_max,
         },
     };
+    let sandbox_network_policy = sandbox_config.network.clone();
+    let sandbox_trusted_domains = sandbox_config.trusted_domains.clone();
     let sandbox_router = Arc::new(moltis_tools::sandbox::SandboxRouter::new(sandbox_config));
 
     // Load any persisted sandbox overrides from session metadata.
@@ -517,6 +530,35 @@ pub async fn start_gateway(
     services = services.with_session_metadata(Arc::clone(&session_metadata));
     services = services.with_session_store(Arc::clone(&session_store));
 
+    // Create domain approval manager if any sandbox uses trusted network mode.
+    let domain_approval = if sandbox_network_policy == moltis_tools::sandbox::NetworkPolicy::Trusted
+    {
+        let mgr = Arc::new(moltis_tools::domain_approval::DomainApprovalManager::new(
+            &sandbox_trusted_domains,
+            std::time::Duration::from_secs(60),
+        ));
+
+        // Start the network proxy server in a background task.
+        let proxy_filter = Arc::clone(&mgr);
+        let proxy_addr = std::net::SocketAddr::from((
+            [0, 0, 0, 0],
+            moltis_tools::network_proxy::DEFAULT_PROXY_PORT,
+        ));
+        let proxy = moltis_tools::network_proxy::NetworkProxyServer::new(proxy_addr, proxy_filter);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            if let Err(e) = proxy.run(shutdown_rx).await {
+                tracing::error!("network proxy error: {e}");
+            }
+        });
+        // Keep shutdown_tx alive by leaking it (proxy runs for the lifetime of the process).
+        std::mem::forget(shutdown_tx);
+
+        Some(mgr)
+    } else {
+        None
+    };
+
     let is_localhost = matches!(bind, "127.0.0.1" | "::1" | "localhost");
     let state = GatewayState::with_options(
         resolved_auth,
@@ -525,6 +567,7 @@ pub async fn start_gateway(
         Some(Arc::clone(&sandbox_router)),
         Some(Arc::clone(&credential_store)),
         webauthn_state,
+        domain_approval.clone(),
         is_localhost,
     );
 
@@ -838,6 +881,14 @@ async fn ws_upgrade_handler(
 #[derive(serde::Serialize)]
 struct GonData {
     identity: moltis_config::ResolvedIdentity,
+    network: GonNetworkData,
+}
+
+#[cfg(feature = "web-ui")]
+#[derive(serde::Serialize)]
+struct GonNetworkData {
+    policy: String,
+    trusted_domains: Vec<String>,
 }
 
 #[cfg(feature = "web-ui")]
@@ -850,7 +901,26 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    GonData { identity }
+
+    let (policy, trusted_domains) = if let Some(ref router) = gw.sandbox_router {
+        let cfg = router.config();
+        let policy = match cfg.network {
+            moltis_tools::sandbox::NetworkPolicy::Blocked => "blocked",
+            moltis_tools::sandbox::NetworkPolicy::Trusted => "trusted",
+            moltis_tools::sandbox::NetworkPolicy::Open => "open",
+        };
+        (policy.to_string(), cfg.trusted_domains.clone())
+    } else {
+        ("blocked".to_string(), vec![])
+    };
+
+    GonData {
+        identity,
+        network: GonNetworkData {
+            policy,
+            trusted_domains,
+        },
+    }
 }
 
 #[cfg(feature = "web-ui")]

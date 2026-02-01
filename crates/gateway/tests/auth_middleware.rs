@@ -48,6 +48,7 @@ async fn start_auth_server_impl(
         None,
         Some(Arc::clone(&cred_store)),
         None,
+        None,
         localhost_only,
     );
     let state_clone = Arc::clone(&state);

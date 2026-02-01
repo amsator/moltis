@@ -196,6 +196,19 @@ pub struct ResourceLimitsConfig {
     pub pids_max: Option<u32>,
 }
 
+/// Network policy for sandboxed containers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkPolicy {
+    /// No network access (`--network=none`).
+    #[default]
+    Blocked,
+    /// Isolated network with HTTP CONNECT proxy filtering by domain allowlist.
+    Trusted,
+    /// Unrestricted network (default bridge).
+    Open,
+}
+
 /// Sandbox configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -205,7 +218,14 @@ pub struct SandboxConfig {
     pub workspace_mount: String,
     pub image: Option<String>,
     pub container_prefix: Option<String>,
-    pub no_network: bool,
+    /// Network policy: "blocked" (default), "trusted", or "open".
+    /// For backward compatibility, the old `no_network` field is also accepted:
+    /// `no_network: true` maps to `blocked`, `no_network: false` maps to `open`.
+    #[serde(deserialize_with = "deserialize_network_policy", default)]
+    pub network: NetworkPolicy,
+    /// Domains allowed through the proxy in `trusted` mode (e.g. `"github.com"`, `"*.npmjs.org"`).
+    #[serde(default)]
+    pub trusted_domains: Vec<String>,
     /// Backend: "auto" (default), "docker", or "apple-container".
     /// "auto" prefers Apple Container on macOS when available, falls back to Docker.
     pub backend: String,
@@ -220,11 +240,52 @@ impl Default for SandboxConfig {
             workspace_mount: "ro".into(),
             image: None,
             container_prefix: None,
-            no_network: true,
+            network: NetworkPolicy::default(),
+            trusted_domains: Vec::new(),
             backend: "auto".into(),
             resource_limits: ResourceLimitsConfig::default(),
         }
     }
+}
+
+/// Custom deserializer that accepts both the new `NetworkPolicy` enum values
+/// and the legacy `no_network: bool` field for backward compatibility.
+fn deserialize_network_policy<'de, D>(deserializer: D) -> Result<NetworkPolicy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct NetworkPolicyVisitor;
+
+    impl<'de> de::Visitor<'de> for NetworkPolicyVisitor {
+        type Value = NetworkPolicy;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str(r#""blocked", "trusted", "open", or a boolean"#)
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<NetworkPolicy, E> {
+            Ok(if v {
+                NetworkPolicy::Blocked
+            } else {
+                NetworkPolicy::Open
+            })
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<NetworkPolicy, E> {
+            match v {
+                "blocked" => Ok(NetworkPolicy::Blocked),
+                "trusted" => Ok(NetworkPolicy::Trusted),
+                "open" => Ok(NetworkPolicy::Open),
+                _ => Err(de::Error::unknown_variant(v, &[
+                    "blocked", "trusted", "open",
+                ])),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(NetworkPolicyVisitor)
 }
 
 /// Tool policy configuration (allow/deny lists).

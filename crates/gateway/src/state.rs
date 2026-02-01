@@ -11,7 +11,9 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 use moltis_protocol::ConnectParams;
 
-use moltis_tools::{approval::ApprovalManager, sandbox::SandboxRouter};
+use moltis_tools::{
+    approval::ApprovalManager, domain_approval::DomainApprovalManager, sandbox::SandboxRouter,
+};
 
 use moltis_channels::ChannelReplyTarget;
 
@@ -167,6 +169,8 @@ pub struct GatewayState {
     pub webauthn_state: Option<Arc<crate::auth_webauthn::WebAuthnState>>,
     /// Per-session sandbox router (None if sandbox is not configured).
     pub sandbox_router: Option<Arc<SandboxRouter>>,
+    /// Domain approval manager for trusted network mode (None if not using trusted mode).
+    pub domain_approval: Option<Arc<DomainApprovalManager>>,
     /// Pending channel reply targets: when a channel message triggers a chat
     /// send, we queue the reply target so the "final" response can be routed
     /// back to the originating channel.
@@ -184,7 +188,16 @@ impl GatewayState {
         services: GatewayServices,
         approval_manager: Arc<ApprovalManager>,
     ) -> Arc<Self> {
-        Self::with_options(auth, services, approval_manager, None, None, None, false)
+        Self::with_options(
+            auth,
+            services,
+            approval_manager,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
     }
 
     pub fn with_sandbox_router(
@@ -200,6 +213,7 @@ impl GatewayState {
             sandbox_router,
             None,
             None,
+            None,
             false,
         )
     }
@@ -211,6 +225,7 @@ impl GatewayState {
         sandbox_router: Option<Arc<SandboxRouter>>,
         credential_store: Option<Arc<CredentialStore>>,
         webauthn_state: Option<Arc<crate::auth_webauthn::WebAuthnState>>,
+        domain_approval: Option<Arc<DomainApprovalManager>>,
         localhost_only: bool,
     ) -> Arc<Self> {
         let hostname = hostname::get()
@@ -236,6 +251,7 @@ impl GatewayState {
             active_sessions: RwLock::new(HashMap::new()),
             active_projects: RwLock::new(HashMap::new()),
             sandbox_router,
+            domain_approval,
             channel_reply_queue: RwLock::new(HashMap::new()),
             setup_code: RwLock::new(None),
             localhost_only,

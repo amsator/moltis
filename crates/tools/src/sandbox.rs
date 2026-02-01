@@ -58,6 +58,20 @@ pub struct ResourceLimits {
     pub pids_max: Option<u32>,
 }
 
+/// Network policy for sandboxed containers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum NetworkPolicy {
+    /// No network access (`--network=none`).
+    #[default]
+    Blocked,
+    /// Isolated network with HTTP CONNECT proxy filtering by domain allowlist.
+    Trusted,
+    /// Unrestricted network (default bridge).
+    Open,
+}
+
 /// Configuration for sandbox behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -67,7 +81,10 @@ pub struct SandboxConfig {
     pub workspace_mount: WorkspaceMount,
     pub image: Option<String>,
     pub container_prefix: Option<String>,
-    pub no_network: bool,
+    /// Network policy: `Blocked` (no network), `Trusted` (proxy-filtered), `Open` (unrestricted).
+    pub network: NetworkPolicy,
+    /// Domains allowed through the proxy in `Trusted` mode.
+    pub trusted_domains: Vec<String>,
     /// Backend: `"auto"` (default), `"docker"`, or `"apple-container"`.
     /// `"auto"` prefers Apple Container on macOS when available.
     pub backend: String,
@@ -82,7 +99,8 @@ impl Default for SandboxConfig {
             workspace_mount: WorkspaceMount::default(),
             image: None,
             container_prefix: None,
-            no_network: false,
+            network: NetworkPolicy::default(),
+            trusted_domains: Vec::new(),
             backend: "auto".into(),
             resource_limits: ResourceLimits::default(),
         }
@@ -118,9 +136,78 @@ pub struct DockerSandbox {
     pub config: SandboxConfig,
 }
 
+/// The Docker network name used for trusted-mode containers.
+pub const TRUSTED_NETWORK_NAME: &str = "moltis-trusted-net";
+
 impl DockerSandbox {
     pub fn new(config: SandboxConfig) -> Self {
         Self { config }
+    }
+
+    /// Ensure the `moltis-trusted-net` internal Docker network exists.
+    /// This is idempotent — if it already exists, this is a no-op.
+    pub async fn ensure_trusted_network() -> Result<()> {
+        // Check if network already exists.
+        let check = tokio::process::Command::new("docker")
+            .args(["network", "inspect", TRUSTED_NETWORK_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+
+        if let Ok(status) = check
+            && status.success()
+        {
+            return Ok(());
+        }
+
+        let output = tokio::process::Command::new("docker")
+            .args(["network", "create", "--internal", TRUSTED_NETWORK_NAME])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Tolerate "already exists" race condition.
+            if !stderr.contains("already exists") {
+                anyhow::bail!("docker network create failed: {}", stderr.trim());
+            }
+        }
+        debug!("ensured docker network: {TRUSTED_NETWORK_NAME}");
+        Ok(())
+    }
+
+    /// Remove the `moltis-trusted-net` Docker network.
+    /// Fails silently if containers are still attached.
+    pub async fn cleanup_trusted_network() {
+        let _ = tokio::process::Command::new("docker")
+            .args(["network", "rm", TRUSTED_NETWORK_NAME])
+            .output()
+            .await;
+    }
+
+    /// Get the gateway IP address on the trusted network.
+    /// This is the IP the proxy listens on from the container's perspective.
+    pub async fn trusted_network_gateway_ip() -> Result<String> {
+        let output = tokio::process::Command::new("docker")
+            .args([
+                "network",
+                "inspect",
+                TRUSTED_NETWORK_NAME,
+                "--format",
+                "{{range .IPAM.Config}}{{.Gateway}}{{end}}",
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            anyhow::bail!("failed to inspect trusted network gateway IP");
+        }
+        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if ip.is_empty() {
+            anyhow::bail!("trusted network gateway IP is empty");
+        }
+        Ok(ip)
     }
 
     fn image(&self) -> &str {
@@ -200,8 +287,41 @@ impl Sandbox for DockerSandbox {
             name.clone(),
         ];
 
-        if self.config.no_network {
-            args.push("--network=none".to_string());
+        match self.config.network {
+            NetworkPolicy::Blocked => {
+                args.push("--network=none".to_string());
+            },
+            NetworkPolicy::Trusted => {
+                // Ensure the internal Docker network exists before attaching.
+                Self::ensure_trusted_network().await?;
+                args.push(format!("--network={TRUSTED_NETWORK_NAME}"));
+
+                // Inject proxy env vars so HTTP(S) traffic goes through the filtering proxy.
+                if let Ok(gateway_ip) = Self::trusted_network_gateway_ip().await {
+                    let proxy_url = format!(
+                        "http://{}:{}",
+                        gateway_ip,
+                        crate::network_proxy::DEFAULT_PROXY_PORT
+                    );
+                    args.extend([
+                        "-e".to_string(),
+                        format!("HTTP_PROXY={proxy_url}"),
+                        "-e".to_string(),
+                        format!("HTTPS_PROXY={proxy_url}"),
+                        "-e".to_string(),
+                        format!("http_proxy={proxy_url}"),
+                        "-e".to_string(),
+                        format!("https_proxy={proxy_url}"),
+                        "-e".to_string(),
+                        "NO_PROXY=localhost,127.0.0.1".to_string(),
+                        "-e".to_string(),
+                        "no_proxy=localhost,127.0.0.1".to_string(),
+                    ]);
+                }
+            },
+            NetworkPolicy::Open => {
+                // Default bridge — no restriction.
+            },
         }
 
         args.extend(self.resource_args());
@@ -646,6 +766,8 @@ pub struct SandboxRouter {
     image_overrides: RwLock<HashMap<String, String>>,
     /// Runtime override for the global default image (set via API, persisted externally).
     global_image_override: RwLock<Option<String>>,
+    /// Per-session network policy overrides.
+    network_overrides: RwLock<HashMap<String, NetworkPolicy>>,
 }
 
 impl SandboxRouter {
@@ -659,6 +781,7 @@ impl SandboxRouter {
             overrides: RwLock::new(HashMap::new()),
             image_overrides: RwLock::new(HashMap::new()),
             global_image_override: RwLock::new(None),
+            network_overrides: RwLock::new(HashMap::new()),
         }
     }
 
@@ -670,6 +793,7 @@ impl SandboxRouter {
             overrides: RwLock::new(HashMap::new()),
             image_overrides: RwLock::new(HashMap::new()),
             global_image_override: RwLock::new(None),
+            network_overrides: RwLock::new(HashMap::new()),
         }
     }
 
@@ -744,6 +868,27 @@ impl SandboxRouter {
     /// Human-readable name of the sandbox backend (e.g. "docker", "apple-container").
     pub fn backend_name(&self) -> &'static str {
         self.backend.backend_name()
+    }
+
+    /// Set a per-session network policy override.
+    pub async fn set_network_override(&self, session_key: &str, policy: NetworkPolicy) {
+        self.network_overrides
+            .write()
+            .await
+            .insert(session_key.to_string(), policy);
+    }
+
+    /// Remove a per-session network policy override.
+    pub async fn remove_network_override(&self, session_key: &str) {
+        self.network_overrides.write().await.remove(session_key);
+    }
+
+    /// Get the effective network policy for a session (override > global config).
+    pub async fn effective_network_policy(&self, session_key: &str) -> NetworkPolicy {
+        if let Some(policy) = self.network_overrides.read().await.get(session_key) {
+            return policy.clone();
+        }
+        self.config.network.clone()
     }
 
     /// Set a per-session image override.
@@ -822,13 +967,13 @@ mod tests {
             "mode": "all",
             "scope": "session",
             "workspace_mount": "rw",
-            "no_network": true,
+            "network": "blocked",
             "resource_limits": {"memory_limit": "1G"}
         }"#;
         let config: SandboxConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.mode, SandboxMode::All);
         assert_eq!(config.workspace_mount, WorkspaceMount::Rw);
-        assert!(config.no_network);
+        assert_eq!(config.network, NetworkPolicy::Blocked);
         assert_eq!(config.resource_limits.memory_limit.as_deref(), Some("1G"));
     }
 

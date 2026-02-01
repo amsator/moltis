@@ -47,6 +47,8 @@ pub async fn start_polling(
     let commands = vec![
         BotCommand::new("new", "Start a new session"),
         BotCommand::new("sessions", "List and switch sessions"),
+        BotCommand::new("model", "Switch provider/model"),
+        BotCommand::new("sandbox", "Toggle sandbox and choose image"),
         BotCommand::new("clear", "Clear session history"),
         BotCommand::new("compact", "Compact session (summarize)"),
         BotCommand::new("context", "Show session context info"),

@@ -803,13 +803,20 @@ impl ChatService for LiveChatService {
         let sandbox_info = if let Some(ref router) = self.state.sandbox_router {
             let is_sandboxed = router.is_sandboxed(&session_key).await;
             let config = router.config();
+            let session_image = session_entry
+                .as_ref()
+                .and_then(|e| e.sandbox_image.clone());
+            let effective_image = match session_image {
+                Some(img) if !img.is_empty() => img,
+                _ => router.default_image().await,
+            };
             serde_json::json!({
                 "enabled": is_sandboxed,
                 "backend": router.backend_name(),
                 "mode": config.mode,
                 "scope": config.scope,
                 "workspaceMount": config.workspace_mount,
-                "image": config.image,
+                "image": effective_image,
             })
         } else {
             serde_json::json!({

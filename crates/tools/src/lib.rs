@@ -14,3 +14,5 @@ pub mod image_cache;
 pub mod network_proxy;
 pub mod policy;
 pub mod sandbox;
+pub mod web_fetch;
+pub mod web_search;

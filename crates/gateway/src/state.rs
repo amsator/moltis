@@ -35,6 +35,9 @@ pub struct ConnectedClient {
     pub sender: mpsc::UnboundedSender<String>,
     pub connected_at: Instant,
     pub last_activity: Instant,
+    /// The `Accept-Language` header from the WebSocket upgrade request, forwarded
+    /// to web tools so fetched pages and search results match the user's locale.
+    pub accept_language: Option<String>,
 }
 
 impl ConnectedClient {
@@ -175,9 +178,13 @@ pub struct GatewayState {
     /// send, we queue the reply target so the "final" response can be routed
     /// back to the originating channel.
     pub channel_reply_queue: RwLock<HashMap<String, Vec<ChannelReplyTarget>>>,
+    /// Hook registry for dispatching lifecycle events.
+    pub hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
+    /// Memory manager for long-term memory search (None if no embedding provider).
+    pub memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
     /// One-time setup code displayed at startup, required during initial setup.
     /// Cleared after successful setup.
-    pub setup_code: RwLock<Option<String>>,
+    pub setup_code: RwLock<Option<secrecy::Secret<String>>>,
     /// Whether the server is bound to a loopback address (localhost/127.0.0.1/::1).
     pub localhost_only: bool,
 }
@@ -197,6 +204,8 @@ impl GatewayState {
             None,
             None,
             false,
+            None,
+            None,
         )
     }
 
@@ -215,9 +224,12 @@ impl GatewayState {
             None,
             None,
             false,
+            None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_options(
         auth: ResolvedAuth,
         services: GatewayServices,
@@ -227,6 +239,8 @@ impl GatewayState {
         webauthn_state: Option<Arc<crate::auth_webauthn::WebAuthnState>>,
         domain_approval: Option<Arc<DomainApprovalManager>>,
         localhost_only: bool,
+        hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
+        memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
     ) -> Arc<Self> {
         let hostname = hostname::get()
             .ok()
@@ -253,6 +267,8 @@ impl GatewayState {
             sandbox_router,
             domain_approval,
             channel_reply_queue: RwLock::new(HashMap::new()),
+            hook_registry,
+            memory_manager,
             setup_code: RwLock::new(None),
             localhost_only,
         })

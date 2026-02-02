@@ -13,6 +13,7 @@ use {
 
 use {
     moltis_agents::{
+        AgentRunError,
         model::StreamEvent,
         prompt::build_system_prompt_with_session,
         providers::ProviderRegistry,
@@ -589,6 +590,7 @@ impl ChatService for LiveChatService {
                         &discovered_skills,
                         hook_registry,
                         accept_language.clone(),
+                        Some(&session_store),
                     )
                     .await
                 }
@@ -1082,6 +1084,7 @@ async fn run_with_tools(
     skills: &[moltis_skills::types::SkillMetadata],
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
     accept_language: Option<String>,
+    session_store: Option<&Arc<SessionStore>>,
 ) -> Option<(String, u32, u32)> {
     // Load identity and user profile from config so the LLM knows who it is.
     let config = moltis_config::discover_and_load();
@@ -1204,18 +1207,104 @@ async fn run_with_tools(
     }
 
     let provider_ref = provider.clone();
-    match run_agent_loop_with_context(
+    let first_result = run_agent_loop_with_context(
         provider,
         tool_registry,
         &system_prompt,
         text,
         Some(&on_event),
         hist,
-        Some(tool_context),
-        hook_registry,
+        Some(tool_context.clone()),
+        hook_registry.clone(),
     )
-    .await
-    {
+    .await;
+
+    // On context-window overflow, compact the session and retry once.
+    let result = match first_result {
+        Err(AgentRunError::ContextWindowExceeded(ref msg)) if session_store.is_some() => {
+            let store = session_store.unwrap();
+            info!(
+                run_id,
+                session = session_key,
+                error = %msg,
+                "context window exceeded — compacting and retrying"
+            );
+
+            broadcast(
+                state,
+                "chat",
+                serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "state": "auto_compact",
+                    "phase": "start",
+                    "reason": "context_window_exceeded",
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+
+            // Inline compaction: summarize history, replace in store.
+            match compact_session(store, session_key, &provider_ref).await {
+                Ok(()) => {
+                    broadcast(
+                        state,
+                        "chat",
+                        serde_json::json!({
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "done",
+                            "reason": "context_window_exceeded",
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+
+                    // Reload compacted history and retry.
+                    let compacted_history = store.read(session_key).await.unwrap_or_default();
+                    let retry_hist = if compacted_history.is_empty() {
+                        None
+                    } else {
+                        Some(compacted_history)
+                    };
+
+                    run_agent_loop_with_context(
+                        provider_ref.clone(),
+                        tool_registry,
+                        &system_prompt,
+                        text,
+                        Some(&on_event),
+                        retry_hist,
+                        Some(tool_context),
+                        hook_registry,
+                    )
+                    .await
+                },
+                Err(e) => {
+                    warn!(run_id, error = %e, "retry compaction failed");
+                    broadcast(
+                        state,
+                        "chat",
+                        serde_json::json!({
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "error",
+                            "error": e.to_string(),
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+                    // Return the original error.
+                    first_result
+                },
+            }
+        },
+        other => other,
+    };
+
+    match result {
         Ok(result) => {
             info!(
                 run_id,
@@ -1224,7 +1313,6 @@ async fn run_with_tools(
                 response = %result.text,
                 "agent run complete"
             );
-            // Assistant message index = user message index + 1.
             let assistant_message_index = user_message_index + 1;
             broadcast(
                 state,
@@ -1270,6 +1358,67 @@ async fn run_with_tools(
             None
         },
     }
+}
+
+/// Compact a session's history by summarizing it with the given provider.
+///
+/// This is a standalone helper so `run_with_tools` can call it without
+/// requiring `&self` on `LiveChatService`.
+async fn compact_session(
+    store: &Arc<SessionStore>,
+    session_key: &str,
+    provider: &Arc<dyn moltis_agents::model::LlmProvider>,
+) -> Result<(), String> {
+    let history = store.read(session_key).await.map_err(|e| e.to_string())?;
+    if history.is_empty() {
+        return Err("nothing to compact".into());
+    }
+
+    let mut summary_messages: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": "system",
+        "content": "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble."
+    })];
+
+    let mut conversation_text = String::new();
+    for msg in &history {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        conversation_text.push_str(&format!("{role}: {content}\n\n"));
+    }
+    summary_messages.push(serde_json::json!({
+        "role": "user",
+        "content": conversation_text,
+    }));
+
+    let mut stream = provider.stream(summary_messages);
+    let mut summary = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            StreamEvent::Delta(delta) => summary.push_str(&delta),
+            StreamEvent::Done(_) => break,
+            StreamEvent::Error(e) => return Err(format!("compact summarization failed: {e}")),
+        }
+    }
+
+    if summary.is_empty() {
+        return Err("compact produced empty summary".into());
+    }
+
+    let compacted = vec![serde_json::json!({
+        "role": "assistant",
+        "content": format!("[Conversation Summary]\n\n{summary}"),
+        "created_at": now_ms(),
+    })];
+
+    store
+        .replace_history(session_key, compacted)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 // ── Streaming mode (no tools) ───────────────────────────────────────────────
@@ -1532,10 +1681,9 @@ mod tests {
         };
 
         let result: Option<(String, u32, u32)> =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), slow_fut).await {
-                Ok(r) => r,
-                Err(_) => None,
-            };
+            tokio::time::timeout(Duration::from_secs(timeout_secs), slow_fut)
+                .await
+                .unwrap_or_default();
 
         assert!(
             result.is_none(),
@@ -1551,10 +1699,9 @@ mod tests {
         let fast_fut = async { Some(("ok".to_string(), 10u32, 5u32)) };
 
         let result = if timeout_secs > 0 {
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), fast_fut).await {
-                Ok(r) => r,
-                Err(_) => None,
-            }
+            tokio::time::timeout(Duration::from_secs(timeout_secs), fast_fut)
+                .await
+                .unwrap_or_default()
         } else {
             fast_fut.await
         };

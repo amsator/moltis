@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use {
-    anyhow::{Result, bail},
+    anyhow::Result,
     tracing::{debug, info, trace, warn},
 };
 
@@ -14,6 +14,40 @@ use crate::{
 
 /// Maximum number of tool-call loop iterations before giving up.
 const MAX_ITERATIONS: usize = 25;
+
+/// Error patterns that indicate the context window has been exceeded.
+const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
+    "context_length_exceeded",
+    "max_tokens",
+    "too many tokens",
+    "request too large",
+    "maximum context length",
+    "context window",
+    "token limit",
+    "content_too_large",
+    "request_too_large",
+];
+
+/// Typed error returned by the agent loop.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentRunError {
+    /// The provider reported that the context window was exceeded.
+    #[error("context window exceeded: {0}")]
+    ContextWindowExceeded(String),
+    /// Any other error.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Check whether an error message indicates a context-window overflow.
+fn is_context_window_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    CONTEXT_WINDOW_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+        || lower.contains("status 413")
+        || lower.contains("http 413")
+}
 
 /// Result of running the agent loop.
 #[derive(Debug)]
@@ -117,7 +151,7 @@ pub async fn run_agent_loop(
     user_message: &str,
     on_event: Option<&OnEvent>,
     history: Option<Vec<serde_json::Value>>,
-) -> Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentRunError> {
     run_agent_loop_with_context(
         provider,
         tools,
@@ -142,7 +176,7 @@ pub async fn run_agent_loop_with_context(
     history: Option<Vec<serde_json::Value>>,
     tool_context: Option<serde_json::Value>,
     hook_registry: Option<Arc<HookRegistry>>,
-) -> Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentRunError> {
     let native_tools = provider.supports_tools();
     let tool_schemas = tools.list_schemas();
 
@@ -171,7 +205,7 @@ pub async fn run_agent_loop_with_context(
         match hooks.dispatch(&payload).await {
             Ok(HookAction::Block(reason)) => {
                 warn!(reason = %reason, "agent start blocked by hook");
-                bail!("agent start blocked by hook: {reason}");
+                return Err(anyhow::anyhow!("agent start blocked by hook: {reason}").into());
             },
             Ok(_) => {},
             Err(e) => {
@@ -211,7 +245,7 @@ pub async fn run_agent_loop_with_context(
         iterations += 1;
         if iterations > MAX_ITERATIONS {
             warn!("agent loop exceeded max iterations ({})", MAX_ITERATIONS);
-            bail!("agent loop exceeded max iterations");
+            return Err(anyhow::anyhow!("agent loop exceeded max iterations").into());
         }
 
         if let Some(cb) = on_event {
@@ -245,7 +279,7 @@ pub async fn run_agent_loop_with_context(
             match hooks.dispatch(&payload).await {
                 Ok(HookAction::Block(reason)) => {
                     warn!(reason = %reason, "message sending blocked by hook");
-                    bail!("message sending blocked by hook: {reason}");
+                    return Err(anyhow::anyhow!("message sending blocked by hook: {reason}").into());
                 },
                 Ok(_) => {},
                 Err(e) => {
@@ -255,7 +289,16 @@ pub async fn run_agent_loop_with_context(
         }
 
         let mut response: CompletionResponse =
-            provider.complete(&messages, schemas_for_api).await?;
+            match provider.complete(&messages, schemas_for_api).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_context_window_error(&msg) {
+                        return Err(AgentRunError::ContextWindowExceeded(msg));
+                    }
+                    return Err(AgentRunError::Other(e));
+                },
+            };
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
@@ -547,7 +590,9 @@ pub async fn run_agent_loop_with_context(
 
 /// Convenience wrapper matching the old stub signature.
 pub async fn run_agent(_agent_id: &str, _session_key: &str, _message: &str) -> Result<String> {
-    bail!("run_agent requires a configured provider and tool registry; use run_agent_loop instead")
+    anyhow::bail!(
+        "run_agent requires a configured provider and tool registry; use run_agent_loop instead"
+    )
 }
 
 #[cfg(test)]
@@ -1286,5 +1331,129 @@ mod tests {
         // The agent still completes — the redacted result is fed to the LLM.
         assert_eq!(result.text, "Done!");
         assert_eq!(result.tool_calls_made, 1);
+    }
+
+    // ── Context window error detection tests ───────────────────────
+
+    #[test]
+    fn test_is_context_window_error_patterns() {
+        assert!(is_context_window_error(
+            "context_length_exceeded: too many tokens"
+        ));
+        assert!(is_context_window_error("request too large for model"));
+        assert!(is_context_window_error(
+            "This model's maximum context length is 128000 tokens"
+        ));
+        assert!(is_context_window_error("HTTP 413 Payload Too Large"));
+        assert!(is_context_window_error("status 413"));
+        assert!(is_context_window_error("content_too_large"));
+        assert!(!is_context_window_error("rate limit exceeded"));
+        assert!(!is_context_window_error("internal server error"));
+    }
+
+    /// Mock provider that returns a context-window error on the first call,
+    /// then succeeds on the second.
+    struct ContextWindowErrorProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ContextWindowErrorProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[serde_json::Value],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                anyhow::bail!(
+                    "context_length_exceeded: This model's maximum context length is 128000 tokens"
+                );
+            }
+            Ok(CompletionResponse {
+                text: Some("Success after retry".into()),
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<serde_json::Value>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_window_error_returned() {
+        let provider = Arc::new(ContextWindowErrorProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools = ToolRegistry::new();
+        let result =
+            run_agent_loop(provider, &tools, "You are a test bot.", "Hi", None, None).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AgentRunError::ContextWindowExceeded(_)),
+            "expected ContextWindowExceeded, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_context_error_is_other() {
+        struct FailProvider;
+
+        #[async_trait]
+        impl LlmProvider for FailProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+
+            fn id(&self) -> &str {
+                "mock"
+            }
+
+            async fn complete(
+                &self,
+                _messages: &[serde_json::Value],
+                _tools: &[serde_json::Value],
+            ) -> Result<CompletionResponse> {
+                anyhow::bail!("internal server error")
+            }
+
+            fn stream(
+                &self,
+                _messages: Vec<serde_json::Value>,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+                Box::pin(tokio_stream::empty())
+            }
+        }
+
+        let provider = Arc::new(FailProvider);
+        let tools = ToolRegistry::new();
+        let result = run_agent_loop(provider, &tools, "system", "hi", None, None).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AgentRunError::Other(_)),
+            "expected Other, got: {err:?}"
+        );
     }
 }

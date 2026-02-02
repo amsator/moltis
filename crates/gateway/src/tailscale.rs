@@ -82,7 +82,8 @@ pub trait TailscaleManager: Send + Sync {
     async fn enable_funnel(&self, port: u16, tls: bool) -> anyhow::Result<()>;
     /// Disable serve/funnel (reset).
     async fn disable(&self) -> anyhow::Result<()>;
-    /// Start the tailscale daemon (`tailscale up`).
+    /// Start the Tailscale service. On macOS this opens the Tailscale app;
+    /// on Linux it runs `tailscale up`.
     async fn up(&self) -> anyhow::Result<()>;
     /// Get the tailscale hostname for this machine.
     async fn hostname(&self) -> anyhow::Result<Option<String>>;
@@ -393,13 +394,29 @@ impl TailscaleManager for CliTailscaleManager {
     }
 
     async fn up(&self) -> anyhow::Result<()> {
-        info!("starting tailscale with `tailscale up`");
-        let output = Self::run_command(&["up"]).await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("tailscale up failed: {stderr}");
+        if cfg!(target_os = "macos") {
+            info!("opening Tailscale.app on macOS");
+            let output = tokio::process::Command::new("open")
+                .args(["-a", "Tailscale"])
+                .output()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to open Tailscale.app: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("failed to open Tailscale.app: {stderr}");
+            }
+            // Give the daemon a moment to start before the caller fetches status.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            info!("Tailscale.app opened");
+        } else {
+            info!("starting tailscale with `tailscale up`");
+            let output = Self::run_command(&["up"]).await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("tailscale up failed: {stderr}");
+            }
+            info!("tailscale up succeeded");
         }
-        info!("tailscale up succeeded");
         Ok(())
     }
 

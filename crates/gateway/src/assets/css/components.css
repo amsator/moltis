@@ -962,6 +962,7 @@
     border: 1px solid var(--border);
     background: var(--surface2);
     font-size: 0.75rem;
+    max-width: 600px;
     white-space: nowrap;
   }
 

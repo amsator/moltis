@@ -124,6 +124,17 @@ All of those are fragile. The gon blob is the single injection point.
 When data changes at runtime, call `gon.refresh()` instead of manually
 updating individual fields — it keeps everything consistent.
 
+## API Namespace Convention
+
+Each navigation tab in the UI should have its own API namespace, both for
+REST endpoints (`/api/<feature>/...`) and RPC methods (`<feature>.*`). This
+keeps concerns separated and makes it straightforward to gate each feature
+behind a cargo feature flag (e.g. `#[cfg(feature = "skills")]`).
+
+Examples: `/api/skills`, `/api/plugins`, `/api/channels`, with RPC methods
+`skills.list`, `plugins.install`, `channels.status`, etc. Never merge
+multiple features into a single endpoint.
+
 ## Authentication Architecture
 
 The gateway supports password and passkey (WebAuthn) authentication, managed

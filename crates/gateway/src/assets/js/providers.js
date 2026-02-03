@@ -461,7 +461,7 @@ function renderLocalModelSelection(provider, sysInfo, modelsData) {
 				if (cmds.length === 1) {
 					installHint.innerHTML = `Install with: <code>${cmds[0]}</code>`;
 				} else {
-					installHint.innerHTML = `Install with any of:<br>${cmds.map((c) => `<code>${c}</code>`).join(" or ")}`;
+					installHint.innerHTML = `Install with any of:<br>${cmds.map((c) => `<code>${c}</code>`).join("<br>")}`;
 				}
 				card.appendChild(installHint);
 			}

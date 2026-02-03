@@ -13,38 +13,40 @@ import { connected } from "./signals.js";
 import * as S from "./state.js";
 import { ConfirmDialog, requestConfirm } from "./ui.js";
 
-var providers = signal([]);
+var configuredModels = signal([]);
 var loading = signal(false);
 
 function fetchProviders() {
 	loading.value = true;
-	sendRpc("providers.available", {}).then((res) => {
+	// Fetch actual models from the registry - this shows all configured models
+	sendRpc("models.list", {}).then((res) => {
 		loading.value = false;
 		if (!res?.ok) return;
-		// Filter to configured only and sort: local/ollama first, then alphabetically
-		providers.value = (res.payload || [])
-			.filter((p) => p.configured)
-			.sort((a, b) => {
-				// Local and Ollama providers come first
-				var aIsLocal = a.authType === "local" || a.name === "ollama";
-				var bIsLocal = b.authType === "local" || b.name === "ollama";
-				if (aIsLocal && !bIsLocal) return -1;
-				if (!aIsLocal && bIsLocal) return 1;
-				return a.displayName.localeCompare(b.displayName);
-			});
-		updateNavCount("providers", providers.value.length);
+		// Sort: local providers first, then alphabetically by provider name
+		var models = (res.payload || []).sort((a, b) => {
+			var aIsLocal = a.provider === "local-llm" || a.provider === "ollama";
+			var bIsLocal = b.provider === "local-llm" || b.provider === "ollama";
+			if (aIsLocal && !bIsLocal) return -1;
+			if (!aIsLocal && bIsLocal) return 1;
+			if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+			return (a.displayName || a.id).localeCompare(b.displayName || b.id);
+		});
+		configuredModels.value = models;
+		updateNavCount("providers", models.length);
 	});
 }
 
-function ProviderCard(props) {
-	var p = props.provider;
-	var isLocal = p.authType === "local";
+function ModelCard(props) {
+	var m = props.model;
+	var isLocal = m.provider === "local-llm";
 
 	function onRemove() {
-		var msg = isLocal ? `Remove ${p.displayName} configuration?` : `Remove credentials for ${p.displayName}?`;
+		var msg = `Remove ${m.displayName || m.id}?`;
 		requestConfirm(msg).then((yes) => {
 			if (!yes) return;
-			sendRpc("providers.remove_key", { provider: p.name }).then((res) => {
+			// For local models, we need a different RPC; for now use provider remove
+			var providerName = isLocal ? "local" : m.provider;
+			sendRpc("providers.remove_key", { provider: providerName }).then((res) => {
 				if (res?.ok) {
 					fetchModels();
 					fetchProviders();
@@ -53,32 +55,26 @@ function ProviderCard(props) {
 		});
 	}
 
-	function getAuthBadgeText() {
-		if (p.authType === "oauth") return "OAuth";
-		if (p.authType === "local") return "Local";
-		return "API Key";
+	function getProviderBadge() {
+		if (m.provider === "local-llm") return "Local";
+		if (m.provider === "ollama") return "Ollama";
+		return m.provider;
 	}
 
-	// Get model info if available
-	var modelInfo = p.model ? p.model : null;
-	var endpointInfo = p.baseUrl && p.baseUrl !== p.defaultBaseUrl ? p.baseUrl : null;
+	var displayName = m.displayName || m.id;
 
 	return html`<div class="provider-item" style="margin-bottom:0;cursor:default;">
 		<div style="flex:1;min-width:0;">
 			<div style="display:flex;align-items:center;gap:8px;">
-				<span class="provider-item-name">${p.displayName}</span>
-				<span class="provider-item-badge ${p.authType}">
-					${getAuthBadgeText()}
+				<span class="provider-item-name">${displayName}</span>
+				<span class="provider-item-badge ${isLocal ? 'local' : 'api-key'}">
+					${getProviderBadge()}
 				</span>
+				${!m.supportsTools ? html`<span class="provider-item-badge" style="background:var(--warning-bg,rgba(234,179,8,.15));color:var(--warning,#eab308);border-color:var(--warning,#eab308);">Chat only</span>` : null}
 			</div>
-			${
-				modelInfo || endpointInfo
-					? html`<div style="font-size:.7rem;color:var(--muted);margin-top:4px;display:flex;flex-wrap:wrap;gap:12px;">
-					${modelInfo ? html`<span>Model: <span style="font-family:var(--font-mono);">${modelInfo}</span></span>` : null}
-					${endpointInfo ? html`<span>Endpoint: <span style="font-family:var(--font-mono);">${endpointInfo}</span></span>` : null}
-				</div>`
-					: null
-			}
+			<div style="font-size:.7rem;color:var(--muted);margin-top:4px;">
+				<span style="font-family:var(--font-mono);">${m.id}</span>
+			</div>
 		</div>
 		<button
 			class="provider-btn provider-btn-danger"
@@ -105,12 +101,12 @@ function ProvidersPage() {
 
 			<div style="max-width:600px;">
 				${
-					loading.value && providers.value.length === 0
+					loading.value && configuredModels.value.length === 0
 						? html`<div class="text-xs text-[var(--muted)]">Loading…</div>`
-						: providers.value.length === 0
+						: configuredModels.value.length === 0
 							? html`<div class="text-xs text-[var(--muted)]" style="padding:12px 0;">No providers configured yet.</div>`
 							: html`<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;">
-								${providers.value.map((p) => html`<${ProviderCard} key=${p.name} provider=${p} />`)}
+								${configuredModels.value.map((m) => html`<${ModelCard} key=${m.id} model=${m} />`)}
 							</div>`
 				}
 

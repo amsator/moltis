@@ -23,6 +23,7 @@ members = [
   "crates/skills",
   "crates/telegram",
   "crates/tools",
+  "crates/wasm",
 ]
 resolver = "2"
 
@@ -88,6 +89,15 @@ rcgen          = "0.13"
 rustls         = { features = ["ring"], version = "0.23" }
 rustls-pemfile = "2"
 tokio-rustls   = "0.26"
+
+# WASM support
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test    = "0.3"
+console_error_panic_hook = "0.1"
+tracing-wasm         = "0.2"
+getrandom            = { features = ["wasm_js"], version = "0.3" }
+serde-wasm-bindgen   = "0.6"
 
 # Workspace crates
 moltis-agents     = { features = ["provider-github-copilot", "provider-kimi-code", "provider-openai-codex"], path = "crates/agents" }

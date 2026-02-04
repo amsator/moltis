@@ -1,0 +1,56 @@
+[package]
+edition.workspace = true
+name              = "moltis-wasm"
+version.workspace = true
+description       = "WebAssembly build of moltis for browser environments"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable console_error_panic_hook for better error messages in browser
+console-panic = ["dep:console_error_panic_hook"]
+
+[dependencies]
+# Core moltis crates (WASM-compatible subset)
+# Note: Using direct path dependency to override default-features
+moltis-common   = { path = "../common", default-features = false, features = ["wasm"] }
+moltis-protocol = { workspace = true }
+
+# WASM bindings
+serde-wasm-bindgen   = { workspace = true }
+wasm-bindgen         = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+
+# Serialization (already WASM-compatible)
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Async for WASM (browser-compatible)
+async-trait = "0.1"
+futures     = { workspace = true }
+
+# Optional: better panic messages in browser console
+console_error_panic_hook = { optional = true, workspace = true }
+
+# Logging for WASM
+tracing            = { workspace = true }
+tracing-subscriber = { features = ["fmt"], version = "0.3" }
+tracing-wasm       = { workspace = true }
+
+# UUID generation (works in WASM)
+uuid = { workspace = true }
+
+# Getrandom with js feature for WASM
+getrandom = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+[lints]
+workspace = true

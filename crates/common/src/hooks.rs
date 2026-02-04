@@ -216,6 +216,10 @@ pub trait HookHandler: Send + Sync {
 
     /// Synchronous handle for hot-path use (e.g. `ToolResultPersist`).
     /// Default implementation blocks on the async `handle`.
+    ///
+    /// Note: On WASM builds, this will panic as blocking is not supported.
+    /// Override this method in WASM-compatible handlers.
+    #[cfg(feature = "native")]
     fn handle_sync(&self, event: HookEvent, payload: &HookPayload) -> Result<HookAction> {
         // Default: spawn a blocking task. Native hooks can override for zero-overhead.
         match tokio::runtime::Handle::try_current() {
@@ -229,6 +233,15 @@ pub trait HookHandler: Send + Sync {
                 rt.block_on(self.handle(event, payload))
             },
         }
+    }
+
+    /// Synchronous handle for hot-path use (e.g. `ToolResultPersist`).
+    ///
+    /// On WASM builds, blocking is not supported. This default implementation
+    /// will panic. Override this method in WASM-compatible handlers.
+    #[cfg(not(feature = "native"))]
+    fn handle_sync(&self, _event: HookEvent, _payload: &HookPayload) -> Result<HookAction> {
+        panic!("handle_sync is not supported on WASM builds; override this method")
     }
 }
 

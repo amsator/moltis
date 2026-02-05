@@ -781,6 +781,7 @@
     gap: 4px;
     opacity: 0;
     transition: opacity 0.15s;
+    flex-shrink: 0;
   }
   .session-item:hover .session-actions {
     opacity: 1;
@@ -809,9 +810,15 @@
     transition: color 0.15s, background 0.15s;
     display: inline-flex;
     align-items: center;
+    flex-shrink: 0;
+  }
+  .session-fork-btn svg {
+    flex-shrink: 0;
+    min-width: 14px;
+    min-height: 14px;
   }
   .session-fork-btn:hover {
-    color: var(--accent);
+    color: var(--text);
     background: var(--surface2);
   }
   .session-delete:hover {

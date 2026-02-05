@@ -690,6 +690,7 @@ var chatPageHTML =
 	'<div class="ml-auto flex items-center gap-1.5">' +
 	'<span id="chatSessionName" class="text-xs text-[var(--muted)] cursor-default" title="Click to rename"></span>' +
 	'<input id="chatSessionRenameInput" class="hidden text-xs text-[var(--text)] bg-[var(--surface2)] border border-[var(--border)] rounded-[var(--radius-sm)] px-1.5 py-0.5 outline-none max-w-[200px]" style="width:0" />' +
+	'<button id="chatSessionFork" class="provider-btn provider-btn-secondary provider-btn-sm hidden">Fork</button>' +
 	'<button id="chatSessionDelete" class="provider-btn provider-btn-danger provider-btn-sm hidden">Delete</button>' +
 	"</div>" +
 	"</div>" +

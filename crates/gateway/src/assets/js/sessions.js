@@ -423,6 +423,19 @@ export function updateChatSessionHeader() {
 		};
 	}
 
+	var forkBtn = S.$("chatSessionFork");
+	if (forkBtn) {
+		forkBtn.classList.toggle("hidden", isMain || isCron);
+		forkBtn.onclick = () => {
+			sendRpc("sessions.fork", { key: S.activeSessionKey }).then((res) => {
+				if (res?.ok && res.payload?.sessionKey) {
+					fetchSessions();
+					switchSession(res.payload.sessionKey);
+				}
+			});
+		};
+	}
+
 	if (deleteBtn) {
 		deleteBtn.classList.toggle("hidden", isMain || isCron);
 		deleteBtn.onclick = () => {

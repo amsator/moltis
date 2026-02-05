@@ -7,8 +7,11 @@ use std::{
 use {
     async_trait::async_trait,
     tokio::sync::{RwLock, oneshot},
-    tracing::{debug, warn},
+    tracing::{debug, instrument, warn},
 };
+
+#[cfg(feature = "metrics")]
+use moltis_metrics::{counter, histogram};
 
 /// Action returned by the domain filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,10 +104,14 @@ impl DomainApprovalManager {
     }
 
     /// Check a domain against the config allowlist and session-approved domains.
+    #[instrument(skip(self), fields(session = %session, domain = %domain))]
     pub async fn check_domain(&self, session: &str, domain: &str) -> FilterAction {
         // Config allowlist.
         for pattern in &self.config_allowlist {
             if pattern.matches(domain) {
+                #[cfg(feature = "metrics")]
+                counter!("domain_checks_total", "result" => "allowed", "source" => "config")
+                    .increment(1);
                 return FilterAction::Allow;
             }
         }
@@ -112,12 +119,19 @@ impl DomainApprovalManager {
         if let Some(domains) = self.session_allowlist.read().await.get(session)
             && domains.contains(&domain.to_lowercase())
         {
+            #[cfg(feature = "metrics")]
+            counter!("domain_checks_total", "result" => "allowed", "source" => "session")
+                .increment(1);
             return FilterAction::Allow;
         }
+        #[cfg(feature = "metrics")]
+        counter!("domain_checks_total", "result" => "needs_approval", "source" => "none")
+            .increment(1);
         FilterAction::NeedsApproval
     }
 
     /// Create a pending approval request. Returns a UUID and a receiver for the decision.
+    #[instrument(skip(self), fields(session = %session, domain = %domain))]
     pub async fn create_request(
         &self,
         session: &str,
@@ -133,14 +147,25 @@ impl DomainApprovalManager {
                 domain: domain.to_string(),
                 session: session.to_string(),
             });
-        debug!(id = %id, domain, session, "domain approval request created");
+        debug!(id = %id, "domain approval request created");
+        #[cfg(feature = "metrics")]
+        counter!("domain_approval_requests_total").increment(1);
         (id, rx)
     }
 
     /// Resolve a pending domain approval request.
     /// If approved, the domain is added to the session allowlist for future requests.
+    #[instrument(skip(self), fields(id = %id, decision = ?decision))]
     pub async fn resolve(&self, id: &str, decision: DomainDecision) {
         if let Some(pending) = self.pending.write().await.remove(id) {
+            let decision_label = match decision {
+                DomainDecision::Approved => "approved",
+                DomainDecision::Denied => "denied",
+                DomainDecision::Timeout => "timeout",
+            };
+            #[cfg(feature = "metrics")]
+            counter!("domain_approval_decisions_total", "decision" => decision_label).increment(1);
+
             if decision == DomainDecision::Approved {
                 self.session_allowlist
                     .write()
@@ -150,15 +175,19 @@ impl DomainApprovalManager {
                     .insert(pending.domain.to_lowercase());
             }
             let _ = pending.tx.send(decision);
-            debug!(id, "domain approval resolved");
+            debug!("domain approval resolved");
         } else {
-            warn!(id, "domain approval resolve: no pending request");
+            warn!("domain approval resolve: no pending request");
         }
     }
 
     /// Wait for a domain approval decision with timeout.
+    #[instrument(skip(self, rx))]
     pub async fn wait_for_decision(&self, rx: oneshot::Receiver<DomainDecision>) -> DomainDecision {
-        match tokio::time::timeout(self.timeout, rx).await {
+        #[cfg(feature = "metrics")]
+        let start = std::time::Instant::now();
+
+        let result = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
             Ok(Err(_)) => {
                 warn!("domain approval channel closed");
@@ -168,7 +197,12 @@ impl DomainApprovalManager {
                 warn!("domain approval timed out");
                 DomainDecision::Timeout
             },
-        }
+        };
+
+        #[cfg(feature = "metrics")]
+        histogram!("domain_approval_wait_duration_seconds").record(start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Return all pending request IDs with their domains and sessions.

@@ -6,8 +6,11 @@ use {
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::{TcpListener, TcpStream},
     },
-    tracing::{debug, info, warn},
+    tracing::{debug, info, instrument, warn},
 };
+
+#[cfg(feature = "metrics")]
+use moltis_metrics::{counter, gauge, histogram};
 
 use crate::domain_approval::{DomainApprovalManager, DomainDecision, DomainFilter, FilterAction};
 
@@ -85,7 +88,27 @@ async fn shutdown_signal(rx: &tokio::sync::watch::Receiver<bool>) {
 /// Handle a single client connection.
 ///
 /// Reads the first line to determine if it's a CONNECT request or a plain HTTP request.
+#[instrument(skip(stream, filter), fields(peer = %peer))]
 async fn handle_client(
+    stream: TcpStream,
+    peer: SocketAddr,
+    filter: Arc<DomainApprovalManager>,
+) -> Result<()> {
+    #[cfg(feature = "metrics")]
+    {
+        counter!("proxy_connections_total").increment(1);
+        gauge!("proxy_connections_active").increment(1.0);
+    }
+
+    let result = handle_client_inner(stream, peer, filter).await;
+
+    #[cfg(feature = "metrics")]
+    gauge!("proxy_connections_active").decrement(1.0);
+
+    result
+}
+
+async fn handle_client_inner(
     stream: TcpStream,
     peer: SocketAddr,
     filter: Arc<DomainApprovalManager>,
@@ -115,12 +138,16 @@ async fn handle_client(
 }
 
 /// Handle an HTTP CONNECT tunnel request.
+#[instrument(skip(reader, filter), fields(peer = %peer, target = %target))]
 async fn handle_connect(
     mut reader: BufReader<TcpStream>,
     peer: SocketAddr,
     target: &str,
     filter: Arc<DomainApprovalManager>,
 ) -> Result<()> {
+    #[cfg(feature = "metrics")]
+    let start = std::time::Instant::now();
+
     // Parse host:port from CONNECT target.
     let (domain, port) = parse_host_port(target)?;
 
@@ -138,8 +165,15 @@ async fn handle_connect(
     let action = filter.check(&session, &domain).await;
 
     match action {
-        FilterAction::Allow => {},
+        FilterAction::Allow => {
+            #[cfg(feature = "metrics")]
+            counter!("proxy_requests_total", "method" => "CONNECT", "result" => "allowed")
+                .increment(1);
+        },
         FilterAction::Deny => {
+            #[cfg(feature = "metrics")]
+            counter!("proxy_requests_total", "method" => "CONNECT", "result" => "denied")
+                .increment(1);
             let resp = "HTTP/1.1 403 Forbidden\r\n\r\n";
             reader.get_mut().write_all(resp.as_bytes()).await?;
             return Ok(());
@@ -149,8 +183,15 @@ async fn handle_connect(
             debug!(id = %id, domain = %domain, "waiting for domain approval");
             let decision = filter.wait_for_decision(rx).await;
             match decision {
-                DomainDecision::Approved => {},
+                DomainDecision::Approved => {
+                    #[cfg(feature = "metrics")]
+                    counter!("proxy_requests_total", "method" => "CONNECT", "result" => "approved")
+                        .increment(1);
+                },
                 DomainDecision::Denied | DomainDecision::Timeout => {
+                    #[cfg(feature = "metrics")]
+                    counter!("proxy_requests_total", "method" => "CONNECT", "result" => "denied")
+                        .increment(1);
                     let resp = "HTTP/1.1 403 Forbidden\r\n\r\n";
                     reader.get_mut().write_all(resp.as_bytes()).await?;
                     return Ok(());
@@ -164,6 +205,8 @@ async fn handle_connect(
     let upstream = match TcpStream::connect(&upstream_addr).await {
         Ok(s) => s,
         Err(e) => {
+            #[cfg(feature = "metrics")]
+            counter!("proxy_upstream_errors_total", "error" => "connect_failed").increment(1);
             let resp = format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{e}");
             reader.get_mut().write_all(resp.as_bytes()).await?;
             return Ok(());
@@ -182,9 +225,29 @@ async fn handle_connect(
     let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
     let u2c = tokio::io::copy(&mut upstream_read, &mut client_write);
 
-    tokio::select! {
-        r = c2u => { if let Err(e) = r { debug!(error = %e, "client->upstream copy ended"); } },
-        r = u2c => { if let Err(e) = r { debug!(error = %e, "upstream->client copy ended"); } },
+    let (c2u_result, u2c_result) = tokio::join!(c2u, u2c);
+
+    #[cfg(feature = "metrics")]
+    {
+        if let Ok(bytes) = c2u_result {
+            counter!("proxy_bytes_transferred_total", "direction" => "client_to_upstream")
+                .increment(bytes);
+        }
+        if let Ok(bytes) = u2c_result {
+            counter!("proxy_bytes_transferred_total", "direction" => "upstream_to_client")
+                .increment(bytes);
+        }
+        histogram!("proxy_tunnel_duration_seconds").record(start.elapsed().as_secs_f64());
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    {
+        if let Err(e) = c2u_result {
+            debug!(error = %e, "client->upstream copy ended");
+        }
+        if let Err(e) = u2c_result {
+            debug!(error = %e, "upstream->client copy ended");
+        }
     }
 
     Ok(())
@@ -193,6 +256,7 @@ async fn handle_connect(
 /// Handle a plain HTTP forward request (non-CONNECT).
 ///
 /// Used when `HTTP_PROXY` is set and the client sends a full URL request.
+#[instrument(skip(reader, filter), fields(peer = %peer, method = %method, target = %target))]
 async fn handle_http_forward(
     mut reader: BufReader<TcpStream>,
     peer: SocketAddr,
@@ -200,6 +264,9 @@ async fn handle_http_forward(
     target: &str,
     filter: Arc<DomainApprovalManager>,
 ) -> Result<()> {
+    #[cfg(feature = "metrics")]
+    let start = std::time::Instant::now();
+
     // Extract host from the URL.
     let domain = extract_host_from_url(target)?;
     let port = extract_port_from_url(target);
@@ -208,8 +275,14 @@ async fn handle_http_forward(
     let action = filter.check(&session, &domain).await;
 
     match action {
-        FilterAction::Allow => {},
+        FilterAction::Allow => {
+            #[cfg(feature = "metrics")]
+            counter!("proxy_requests_total", "method" => "HTTP", "result" => "allowed")
+                .increment(1);
+        },
         FilterAction::Deny => {
+            #[cfg(feature = "metrics")]
+            counter!("proxy_requests_total", "method" => "HTTP", "result" => "denied").increment(1);
             let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
             reader.get_mut().write_all(resp.as_bytes()).await?;
             return Ok(());
@@ -219,8 +292,15 @@ async fn handle_http_forward(
             debug!(id = %id, domain = %domain, "waiting for domain approval (HTTP)");
             let decision = filter.wait_for_decision(rx).await;
             match decision {
-                DomainDecision::Approved => {},
+                DomainDecision::Approved => {
+                    #[cfg(feature = "metrics")]
+                    counter!("proxy_requests_total", "method" => "HTTP", "result" => "approved")
+                        .increment(1);
+                },
                 DomainDecision::Denied | DomainDecision::Timeout => {
+                    #[cfg(feature = "metrics")]
+                    counter!("proxy_requests_total", "method" => "HTTP", "result" => "denied")
+                        .increment(1);
                     let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
                     reader.get_mut().write_all(resp.as_bytes()).await?;
                     return Ok(());
@@ -245,6 +325,8 @@ async fn handle_http_forward(
     let mut upstream = match TcpStream::connect(&upstream_addr).await {
         Ok(s) => s,
         Err(e) => {
+            #[cfg(feature = "metrics")]
+            counter!("proxy_upstream_errors_total", "error" => "connect_failed").increment(1);
             let resp = format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{e}");
             reader.get_mut().write_all(resp.as_bytes()).await?;
             return Ok(());
@@ -266,9 +348,29 @@ async fn handle_http_forward(
     let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
     let u2c = tokio::io::copy(&mut upstream_read, &mut client_write);
 
-    tokio::select! {
-        r = c2u => { if let Err(e) = r { debug!(error = %e, "client->upstream copy ended"); } },
-        r = u2c => { if let Err(e) = r { debug!(error = %e, "upstream->client copy ended"); } },
+    let (c2u_result, u2c_result) = tokio::join!(c2u, u2c);
+
+    #[cfg(feature = "metrics")]
+    {
+        if let Ok(bytes) = c2u_result {
+            counter!("proxy_bytes_transferred_total", "direction" => "client_to_upstream")
+                .increment(bytes);
+        }
+        if let Ok(bytes) = u2c_result {
+            counter!("proxy_bytes_transferred_total", "direction" => "upstream_to_client")
+                .increment(bytes);
+        }
+        histogram!("proxy_request_duration_seconds").record(start.elapsed().as_secs_f64());
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    {
+        if let Err(e) = c2u_result {
+            debug!(error = %e, "client->upstream copy ended");
+        }
+        if let Err(e) = u2c_result {
+            debug!(error = %e, "upstream->client copy ended");
+        }
     }
 
     Ok(())

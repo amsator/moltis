@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { refresh as refreshGon } from "./gon.js";
 import { sendRpc } from "./helpers.js";
 import * as push from "./push.js";
+import { isStandalone } from "./pwa.js";
 import { navigate, registerPrefix } from "./router.js";
 import * as S from "./state.js";
 
@@ -1463,6 +1464,10 @@ function NotificationsSection() {
 		</div>`;
 	}
 
+	// Check if running as installed PWA - push notifications require installation on Safari
+	var standalone = isStandalone();
+	var needsInstall = !standalone && /Safari/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent);
+
 	return html`<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
 		<h2 class="text-lg font-medium text-[var(--text-strong)]">Notifications</h2>
 		<p class="text-xs text-[var(--muted)] leading-relaxed" style="max-width:600px;margin:0;">
@@ -1476,18 +1481,20 @@ function NotificationsSection() {
 					<div class="provider-item-name" style="font-size:.9rem;">Push Notifications</div>
 					<div style="font-size:.75rem;color:var(--muted);margin-top:2px;">
 						${
-							subscribed
-								? "You will receive notifications on this device."
-								: permission === "denied"
-									? "Notifications are blocked. Enable them in browser settings."
-									: "Enable to receive notifications on this device."
+							needsInstall
+								? "Add this app to your Dock to enable notifications."
+								: subscribed
+									? "You will receive notifications on this device."
+									: permission === "denied"
+										? "Notifications are blocked. Enable them in browser settings."
+										: "Enable to receive notifications on this device."
 						}
 					</div>
 				</div>
 				<button
 					class="provider-btn ${subscribed ? "provider-btn-danger" : ""}"
 					onClick=${onToggle}
-					disabled=${toggling || permission === "denied"}
+					disabled=${toggling || permission === "denied" || needsInstall}
 				>
 					${toggling ? "…" : subscribed ? "Disable" : "Enable"}
 				</button>
@@ -1495,9 +1502,26 @@ function NotificationsSection() {
 			${error ? html`<div class="text-xs" style="margin-top:8px;color:var(--error);">${error}</div>` : null}
 		</div>
 
+		<!-- Install required notice -->
+		${
+			needsInstall
+				? html`
+			<div style="max-width:600px;padding:12px 16px;border-radius:6px;border:1px solid var(--border);background:var(--surface);">
+				<p class="text-sm text-[var(--text)]" style="margin:0;font-weight:500;">
+					Installation required
+				</p>
+				<p class="text-xs text-[var(--muted)]" style="margin:8px 0 0;">
+					On Safari, push notifications are only available for installed apps. Add moltis to your Dock using
+					<strong>File → Add to Dock</strong> (or Share → Add to Dock on iOS), then open it from there.
+				</p>
+			</div>
+		`
+				: null
+		}
+
 		<!-- Permission status -->
 		${
-			permission === "denied"
+			permission === "denied" && !needsInstall
 				? html`
 			<div style="max-width:600px;padding:12px 16px;border-radius:6px;border:1px solid var(--error);background:color-mix(in srgb, var(--error) 5%, transparent);">
 				<p class="text-sm" style="color:var(--error);margin:0;font-weight:500;">

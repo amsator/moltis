@@ -14,6 +14,7 @@
 
 # Features
 
+- [Channels](channels.md)
 - [LLM Providers](providers.md)
 - [MCP Servers](mcp.md)
 - [Hooks](hooks.md)

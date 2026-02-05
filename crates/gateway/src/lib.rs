@@ -43,5 +43,6 @@ pub mod tailscale;
 pub mod tailscale_routes;
 #[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(feature = "whatsapp-business")]
 pub mod whatsapp_routes;
 pub mod ws;

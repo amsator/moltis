@@ -14,7 +14,7 @@ use {
     tracing::{debug, warn},
 };
 
-use moltis_whatsapp::{
+use moltis_whatsapp_business::{
     WhatsAppPlugin,
     types::WebhookPayload,
     webhook::{process_webhook, verify_signature, verify_webhook_subscription},

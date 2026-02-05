@@ -326,9 +326,12 @@ pub struct ChannelsConfig {
     /// Telegram bot accounts, keyed by account ID.
     #[serde(default)]
     pub telegram: HashMap<String, serde_json::Value>,
-    /// WhatsApp Business accounts, keyed by account ID.
+    /// WhatsApp Business Cloud API accounts, keyed by account ID.
     #[serde(default)]
     pub whatsapp: HashMap<String, serde_json::Value>,
+    /// WhatsApp Web accounts (via Baileys sidecar), keyed by account ID.
+    #[serde(default)]
+    pub whatsapp_web: HashMap<String, serde_json::Value>,
 }
 
 /// TLS configuration for the gateway HTTPS server.

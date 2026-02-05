@@ -608,7 +608,10 @@ pub async fn start_gateway(
     // Session service is wired after hook registry is built (below).
 
     // Wire channel store, Telegram, and WhatsApp channel services.
-    let whatsapp_plugin: Arc<tokio::sync::RwLock<moltis_whatsapp::WhatsAppPlugin>>;
+    #[cfg(feature = "whatsapp-business")]
+    let whatsapp_plugin: Arc<tokio::sync::RwLock<moltis_whatsapp_business::WhatsAppPlugin>>;
+    #[cfg(feature = "whatsapp-web")]
+    let _whatsapp_web_plugin: Arc<tokio::sync::RwLock<moltis_whatsapp::WhatsAppPlugin>>;
     {
         use moltis_channels::store::ChannelStore;
 
@@ -628,8 +631,15 @@ pub async fn start_gateway(
             .with_message_log(Arc::clone(&message_log))
             .with_event_sink(Arc::clone(&channel_sink));
 
-        // Initialize WhatsApp plugin.
-        let mut wa_plugin = moltis_whatsapp::WhatsAppPlugin::new()
+        // Initialize WhatsApp Business plugin.
+        #[cfg(feature = "whatsapp-business")]
+        let mut wa_plugin = moltis_whatsapp_business::WhatsAppPlugin::new()
+            .with_message_log(Arc::clone(&message_log))
+            .with_event_sink(Arc::clone(&channel_sink));
+
+        // Initialize WhatsApp Web plugin.
+        #[cfg(feature = "whatsapp-web")]
+        let mut wa_web_plugin = moltis_whatsapp::WhatsAppPlugin::new()
             .with_message_log(Arc::clone(&message_log))
             .with_event_sink(Arc::clone(&channel_sink));
 
@@ -647,17 +657,40 @@ pub async fn start_gateway(
             }
         }
 
-        // Start WhatsApp channels from config file.
-        let wa_accounts = &config.channels.whatsapp;
+        // Start WhatsApp Business channels from config file.
+        #[cfg(feature = "whatsapp-business")]
         let mut wa_started: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (account_id, account_config) in wa_accounts {
-            if let Err(e) = wa_plugin
-                .start_account(account_id, account_config.clone())
-                .await
-            {
-                tracing::warn!(account_id, "failed to start whatsapp account: {e}");
-            } else {
-                wa_started.insert(account_id.clone());
+        #[cfg(feature = "whatsapp-business")]
+        {
+            let wa_accounts = &config.channels.whatsapp;
+            for (account_id, account_config) in wa_accounts {
+                if let Err(e) = wa_plugin
+                    .start_account(account_id, account_config.clone())
+                    .await
+                {
+                    tracing::warn!(account_id, "failed to start whatsapp business account: {e}");
+                } else {
+                    wa_started.insert(account_id.clone());
+                }
+            }
+        }
+
+        // Start WhatsApp Web channels from config file.
+        #[cfg(feature = "whatsapp-web")]
+        let mut wa_web_started: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        #[cfg(feature = "whatsapp-web")]
+        {
+            let wa_web_accounts = &config.channels.whatsapp_web;
+            for (account_id, account_config) in wa_web_accounts {
+                if let Err(e) = wa_web_plugin
+                    .start_account(account_id, account_config.clone())
+                    .await
+                {
+                    tracing::warn!(account_id, "failed to start whatsapp web account: {e}");
+                } else {
+                    wa_web_started.insert(account_id.clone());
+                }
             }
         }
 
@@ -690,27 +723,53 @@ pub async fn start_gateway(
                                 tg_started.insert(ch.account_id);
                             }
                         },
+                        #[cfg(feature = "whatsapp-business")]
                         "whatsapp" => {
                             if wa_started.contains(&ch.account_id) {
                                 info!(
                                     account_id = ch.account_id,
-                                    "skipping stored whatsapp channel (already started from config)"
+                                    "skipping stored whatsapp business channel (already started from config)"
                                 );
                                 continue;
                             }
                             info!(
                                 account_id = ch.account_id,
                                 channel_type = ch.channel_type,
-                                "starting stored whatsapp channel"
+                                "starting stored whatsapp business channel"
                             );
                             if let Err(e) = wa_plugin.start_account(&ch.account_id, ch.config).await
                             {
                                 tracing::warn!(
                                     account_id = ch.account_id,
-                                    "failed to start stored whatsapp account: {e}"
+                                    "failed to start stored whatsapp business account: {e}"
                                 );
                             } else {
                                 wa_started.insert(ch.account_id);
+                            }
+                        },
+                        #[cfg(feature = "whatsapp-web")]
+                        "whatsapp-web" => {
+                            if wa_web_started.contains(&ch.account_id) {
+                                info!(
+                                    account_id = ch.account_id,
+                                    "skipping stored whatsapp web channel (already started from config)"
+                                );
+                                continue;
+                            }
+                            info!(
+                                account_id = ch.account_id,
+                                channel_type = ch.channel_type,
+                                "starting stored whatsapp web channel"
+                            );
+                            if let Err(e) =
+                                wa_web_plugin.start_account(&ch.account_id, ch.config).await
+                            {
+                                tracing::warn!(
+                                    account_id = ch.account_id,
+                                    "failed to start stored whatsapp web account: {e}"
+                                );
+                            } else {
+                                wa_web_started.insert(ch.account_id);
                             }
                         },
                         _ => {
@@ -731,14 +790,29 @@ pub async fn start_gateway(
         if !tg_started.is_empty() {
             info!("{} telegram account(s) started", tg_started.len());
         }
+        #[cfg(feature = "whatsapp-business")]
         if !wa_started.is_empty() {
-            info!("{} whatsapp account(s) started", wa_started.len());
+            info!("{} whatsapp business account(s) started", wa_started.len());
+        }
+        #[cfg(feature = "whatsapp-web")]
+        if !wa_web_started.is_empty() {
+            info!("{} whatsapp web account(s) started", wa_web_started.len());
         }
 
         // Grab shared outbound before moving plugins into the channel service.
         let tg_outbound = tg_plugin.shared_outbound();
         services = services.with_channel_outbound(tg_outbound);
 
+        #[cfg(all(feature = "whatsapp-business", feature = "whatsapp-web"))]
+        let live_channel_service = crate::channel::LiveChannelService::new(
+            tg_plugin,
+            wa_plugin,
+            wa_web_plugin,
+            channel_store,
+            Arc::clone(&message_log),
+            Arc::clone(&session_metadata),
+        );
+        #[cfg(all(feature = "whatsapp-business", not(feature = "whatsapp-web")))]
         let live_channel_service = crate::channel::LiveChannelService::new(
             tg_plugin,
             wa_plugin,
@@ -746,9 +820,33 @@ pub async fn start_gateway(
             Arc::clone(&message_log),
             Arc::clone(&session_metadata),
         );
+        #[cfg(all(not(feature = "whatsapp-business"), feature = "whatsapp-web"))]
+        let live_channel_service = crate::channel::LiveChannelService::new(
+            tg_plugin,
+            wa_web_plugin,
+            channel_store,
+            Arc::clone(&message_log),
+            Arc::clone(&session_metadata),
+        );
+        #[cfg(all(not(feature = "whatsapp-business"), not(feature = "whatsapp-web")))]
+        let live_channel_service = crate::channel::LiveChannelService::new(
+            tg_plugin,
+            channel_store,
+            Arc::clone(&message_log),
+            Arc::clone(&session_metadata),
+        );
 
-        // Keep a reference to the WhatsApp plugin for webhook routes.
-        whatsapp_plugin = live_channel_service.whatsapp();
+        // Keep a reference to the WhatsApp Business plugin for webhook routes.
+        #[cfg(feature = "whatsapp-business")]
+        {
+            whatsapp_plugin = live_channel_service.whatsapp();
+        }
+
+        // Keep a reference to the WhatsApp Web plugin (for future routes).
+        #[cfg(feature = "whatsapp-web")]
+        {
+            _whatsapp_web_plugin = live_channel_service.whatsapp_web();
+        }
 
         services.channel = Arc::new(live_channel_service);
     }
@@ -1279,10 +1377,14 @@ pub async fn start_gateway(
 
     let methods = Arc::new(MethodRegistry::new());
 
-    #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
+    #[cfg_attr(
+        not(any(feature = "tls", feature = "whatsapp-business")),
+        allow(unused_mut)
+    )]
     let mut app = build_gateway_app(Arc::clone(&state), Arc::clone(&methods));
 
     // Add WhatsApp webhook routes.
+    #[cfg(feature = "whatsapp-business")]
     {
         use axum::{Router, routing::get};
 

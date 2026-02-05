@@ -7,10 +7,11 @@ use {
     tracing::{error, info, warn},
 };
 
-use {
-    moltis_channels::ChannelPlugin, moltis_telegram::TelegramPlugin,
-    moltis_whatsapp::WhatsAppPlugin,
-};
+#[cfg(feature = "whatsapp-web")]
+use moltis_whatsapp::WhatsAppPlugin as WhatsAppWebPlugin;
+#[cfg(feature = "whatsapp-business")]
+use moltis_whatsapp_business::WhatsAppPlugin;
+use {moltis_channels::ChannelPlugin, moltis_telegram::TelegramPlugin};
 
 use {
     moltis_channels::{
@@ -29,16 +30,39 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Live channel service backed by `TelegramPlugin` and `WhatsAppPlugin`.
+/// Live channel service backed by `TelegramPlugin` and optionally `WhatsAppPlugin`.
 pub struct LiveChannelService {
     telegram: Arc<RwLock<TelegramPlugin>>,
+    #[cfg(feature = "whatsapp-business")]
     whatsapp: Arc<RwLock<WhatsAppPlugin>>,
+    #[cfg(feature = "whatsapp-web")]
+    whatsapp_web: Arc<RwLock<WhatsAppWebPlugin>>,
     store: Arc<dyn ChannelStore>,
     message_log: Arc<dyn MessageLog>,
     session_metadata: Arc<SqliteSessionMetadata>,
 }
 
 impl LiveChannelService {
+    #[cfg(all(feature = "whatsapp-business", feature = "whatsapp-web"))]
+    pub fn new(
+        telegram: TelegramPlugin,
+        whatsapp: WhatsAppPlugin,
+        whatsapp_web: WhatsAppWebPlugin,
+        store: Arc<dyn ChannelStore>,
+        message_log: Arc<dyn MessageLog>,
+        session_metadata: Arc<SqliteSessionMetadata>,
+    ) -> Self {
+        Self {
+            telegram: Arc::new(RwLock::new(telegram)),
+            whatsapp: Arc::new(RwLock::new(whatsapp)),
+            whatsapp_web: Arc::new(RwLock::new(whatsapp_web)),
+            store,
+            message_log,
+            session_metadata,
+        }
+    }
+
+    #[cfg(all(feature = "whatsapp-business", not(feature = "whatsapp-web")))]
     pub fn new(
         telegram: TelegramPlugin,
         whatsapp: WhatsAppPlugin,
@@ -55,9 +79,101 @@ impl LiveChannelService {
         }
     }
 
-    /// Get a reference to the WhatsApp plugin (for webhook handlers).
+    #[cfg(all(not(feature = "whatsapp-business"), feature = "whatsapp-web"))]
+    pub fn new(
+        telegram: TelegramPlugin,
+        whatsapp_web: WhatsAppWebPlugin,
+        store: Arc<dyn ChannelStore>,
+        message_log: Arc<dyn MessageLog>,
+        session_metadata: Arc<SqliteSessionMetadata>,
+    ) -> Self {
+        Self {
+            telegram: Arc::new(RwLock::new(telegram)),
+            whatsapp_web: Arc::new(RwLock::new(whatsapp_web)),
+            store,
+            message_log,
+            session_metadata,
+        }
+    }
+
+    #[cfg(all(not(feature = "whatsapp-business"), not(feature = "whatsapp-web")))]
+    pub fn new(
+        telegram: TelegramPlugin,
+        store: Arc<dyn ChannelStore>,
+        message_log: Arc<dyn MessageLog>,
+        session_metadata: Arc<SqliteSessionMetadata>,
+    ) -> Self {
+        Self {
+            telegram: Arc::new(RwLock::new(telegram)),
+            store,
+            message_log,
+            session_metadata,
+        }
+    }
+
+    /// Get a reference to the WhatsApp Business plugin (for webhook handlers).
+    #[cfg(feature = "whatsapp-business")]
     pub fn whatsapp(&self) -> Arc<RwLock<WhatsAppPlugin>> {
         Arc::clone(&self.whatsapp)
+    }
+
+    /// Get a reference to the WhatsApp Web plugin.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn whatsapp_web(&self) -> Arc<RwLock<WhatsAppWebPlugin>> {
+        Arc::clone(&self.whatsapp_web)
+    }
+
+    /// Get allowlist from the stored channel config.
+    async fn get_allowlist(&self, account_id: &str) -> Vec<String> {
+        // Try to read allowlist from the store (works for any channel type).
+        if let Ok(Some(stored)) = self.store.get(account_id).await
+            && let Some(list) = stored
+                .config
+                .get("allowlist")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+        {
+            return list;
+        }
+
+        // Fallback: try telegram config.
+        let tg = self.telegram.read().await;
+        if let Some(list) = tg
+            .account_config(account_id)
+            .and_then(|cfg| cfg.get("allowlist").cloned())
+            .and_then(|v| serde_json::from_value(v).ok())
+        {
+            return list;
+        }
+        drop(tg);
+
+        // Fallback: try whatsapp business config.
+        #[cfg(feature = "whatsapp-business")]
+        {
+            let wa = self.whatsapp.read().await;
+            if let Some(list) = wa
+                .account_config(account_id)
+                .and_then(|cfg| cfg.get("allowlist").cloned())
+                .and_then(|v| serde_json::from_value(v).ok())
+            {
+                return list;
+            }
+        }
+
+        // Fallback: try whatsapp web config.
+        #[cfg(feature = "whatsapp-web")]
+        {
+            let wa_web = self.whatsapp_web.read().await;
+            if let Some(list) = wa_web
+                .account_config(account_id)
+                .and_then(|cfg| cfg.get("allowlist").cloned())
+                .and_then(|v| serde_json::from_value(v).ok())
+            {
+                return list;
+            }
+        }
+
+        Vec::new()
     }
 }
 
@@ -127,7 +243,8 @@ impl ChannelService for LiveChannelService {
             }
         }
 
-        // WhatsApp channels
+        // WhatsApp Business channels
+        #[cfg(feature = "whatsapp-business")]
         {
             let wa = self.whatsapp.read().await;
             let account_ids = wa.account_ids();
@@ -138,7 +255,7 @@ impl ChannelService for LiveChannelService {
                         Ok(snap) => {
                             let mut entry = serde_json::json!({
                                 "type": "whatsapp",
-                                "name": format!("WhatsApp ({})", aid),
+                                "name": format!("WhatsApp Business ({})", aid),
                                 "account_id": aid,
                                 "status": if snap.connected { "connected" } else { "disconnected" },
                                 "details": snap.details,
@@ -177,7 +294,74 @@ impl ChannelService for LiveChannelService {
                         Err(e) => {
                             channels.push(serde_json::json!({
                                 "type": "whatsapp",
-                                "name": format!("WhatsApp ({})", aid),
+                                "name": format!("WhatsApp Business ({})", aid),
+                                "account_id": aid,
+                                "status": "error",
+                                "details": e.to_string(),
+                            }));
+                        },
+                    }
+                }
+            }
+        }
+
+        // WhatsApp Web channels
+        #[cfg(feature = "whatsapp-web")]
+        {
+            let wa_web = self.whatsapp_web.read().await;
+            let account_ids = wa_web.account_ids();
+
+            if let Some(status) = wa_web.status() {
+                for aid in &account_ids {
+                    match status.probe(aid).await {
+                        Ok(snap) => {
+                            let mut entry = serde_json::json!({
+                                "type": "whatsapp-web",
+                                "name": format!("WhatsApp Web ({})", aid),
+                                "account_id": aid,
+                                "status": if snap.connected { "connected" } else { "disconnected" },
+                                "details": snap.details,
+                            });
+                            if let Some(cfg) = wa_web.account_config(aid) {
+                                entry["config"] = cfg;
+                            }
+
+                            // Include QR code if available.
+                            if let Some(qr) = wa_web.get_qr_code(aid) {
+                                entry["qr_code"] = serde_json::json!(qr);
+                            }
+
+                            // Include bound sessions and active session mappings.
+                            let bound = self
+                                .session_metadata
+                                .list_account_sessions("whatsapp-web", aid)
+                                .await;
+                            let active_map = self
+                                .session_metadata
+                                .list_active_sessions("whatsapp-web", aid)
+                                .await;
+                            let sessions: Vec<_> = bound
+                                .iter()
+                                .map(|s| {
+                                    let is_active = active_map.iter().any(|(_, sk)| sk == &s.key);
+                                    serde_json::json!({
+                                        "key": s.key,
+                                        "label": s.label,
+                                        "messageCount": s.message_count,
+                                        "active": is_active,
+                                    })
+                                })
+                                .collect();
+                            if !sessions.is_empty() {
+                                entry["sessions"] = serde_json::json!(sessions);
+                            }
+
+                            channels.push(entry);
+                        },
+                        Err(e) => {
+                            channels.push(serde_json::json!({
+                                "type": "whatsapp-web",
+                                "name": format!("WhatsApp Web ({})", aid),
                                 "account_id": aid,
                                 "status": "error",
                                 "details": e.to_string(),
@@ -219,14 +403,28 @@ impl ChannelService for LiveChannelService {
                         e.to_string()
                     })?;
             },
+            #[cfg(feature = "whatsapp-business")]
             "whatsapp" => {
-                info!(account_id, "adding whatsapp channel account");
+                info!(account_id, "adding whatsapp business channel account");
 
                 let mut wa = self.whatsapp.write().await;
                 wa.start_account(account_id, config.clone())
                     .await
                     .map_err(|e| {
-                        error!(error = %e, account_id, "failed to start whatsapp account");
+                        error!(error = %e, account_id, "failed to start whatsapp business account");
+                        e.to_string()
+                    })?;
+            },
+            #[cfg(feature = "whatsapp-web")]
+            "whatsapp-web" => {
+                info!(account_id, "adding whatsapp web channel account");
+
+                let mut wa_web = self.whatsapp_web.write().await;
+                wa_web
+                    .start_account(account_id, config.clone())
+                    .await
+                    .map_err(|e| {
+                        error!(error = %e, account_id, "failed to start whatsapp web account");
                         e.to_string()
                     })?;
             },
@@ -271,11 +469,21 @@ impl ChannelService for LiveChannelService {
                     e.to_string()
                 })?;
             },
+            #[cfg(feature = "whatsapp-business")]
             "whatsapp" => {
-                info!(account_id, "removing whatsapp channel account");
+                info!(account_id, "removing whatsapp business channel account");
                 let mut wa = self.whatsapp.write().await;
                 wa.stop_account(account_id).await.map_err(|e| {
-                    error!(error = %e, account_id, "failed to stop whatsapp account");
+                    error!(error = %e, account_id, "failed to stop whatsapp business account");
+                    e.to_string()
+                })?;
+            },
+            #[cfg(feature = "whatsapp-web")]
+            "whatsapp-web" => {
+                info!(account_id, "removing whatsapp web channel account");
+                let mut wa_web = self.whatsapp_web.write().await;
+                wa_web.stop_account(account_id).await.map_err(|e| {
+                    error!(error = %e, account_id, "failed to stop whatsapp web account");
                     e.to_string()
                 })?;
             },
@@ -327,20 +535,40 @@ impl ChannelService for LiveChannelService {
                         e.to_string()
                     })?;
             },
+            #[cfg(feature = "whatsapp-business")]
             "whatsapp" => {
-                info!(account_id, "updating whatsapp channel account");
+                info!(account_id, "updating whatsapp business channel account");
                 let mut wa = self.whatsapp.write().await;
 
                 // Stop then restart with new config
                 wa.stop_account(account_id).await.map_err(|e| {
-                    error!(error = %e, account_id, "failed to stop whatsapp account for update");
+                    error!(error = %e, account_id, "failed to stop whatsapp business account for update");
                     e.to_string()
                 })?;
 
                 wa.start_account(account_id, config.clone())
                     .await
                     .map_err(|e| {
-                        error!(error = %e, account_id, "failed to restart whatsapp account after update");
+                        error!(error = %e, account_id, "failed to restart whatsapp business account after update");
+                        e.to_string()
+                    })?;
+            },
+            #[cfg(feature = "whatsapp-web")]
+            "whatsapp-web" => {
+                info!(account_id, "updating whatsapp web channel account");
+                let mut wa_web = self.whatsapp_web.write().await;
+
+                // Stop then restart with new config
+                wa_web.stop_account(account_id).await.map_err(|e| {
+                    error!(error = %e, account_id, "failed to stop whatsapp web account for update");
+                    e.to_string()
+                })?;
+
+                wa_web
+                    .start_account(account_id, config.clone())
+                    .await
+                    .map_err(|e| {
+                        error!(error = %e, account_id, "failed to restart whatsapp web account after update");
                         e.to_string()
                     })?;
             },
@@ -381,21 +609,7 @@ impl ChannelService for LiveChannelService {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Try to read allowlist from telegram config first, then whatsapp.
-        let allowlist: Vec<String> = {
-            let tg = self.telegram.read().await;
-            tg.account_config(account_id)
-                .and_then(|cfg| cfg.get("allowlist").cloned())
-                .and_then(|v| serde_json::from_value(v).ok())
-        }
-        .or_else(|| {
-            // Try WhatsApp if telegram didn't have it.
-            let wa = futures::executor::block_on(self.whatsapp.read());
-            wa.account_config(account_id)
-                .and_then(|cfg| cfg.get("allowlist").cloned())
-                .and_then(|v| serde_json::from_value(v).ok())
-        })
-        .unwrap_or_default();
+        let allowlist = self.get_allowlist(account_id).await;
 
         let list: Vec<Value> = senders
             .into_iter()
@@ -482,27 +696,8 @@ impl ChannelService for LiveChannelService {
         }
 
         // Restart account with new config.
-        match stored.channel_type.as_str() {
-            "telegram" => {
-                let mut tg = self.telegram.write().await;
-                if let Err(e) = tg.stop_account(account_id).await {
-                    warn!(error = %e, account_id, "failed to stop account for sender approval");
-                }
-                tg.start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            },
-            "whatsapp" => {
-                let mut wa = self.whatsapp.write().await;
-                if let Err(e) = wa.stop_account(account_id).await {
-                    warn!(error = %e, account_id, "failed to stop account for sender approval");
-                }
-                wa.start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            },
-            _ => return Err(format!("unsupported channel type: {}", stored.channel_type)),
-        }
+        self.restart_account(&stored.channel_type, account_id, config)
+            .await?;
 
         info!(account_id, identifier, "sender approved");
         Ok(serde_json::json!({ "approved": identifier }))
@@ -553,29 +748,55 @@ impl ChannelService for LiveChannelService {
         }
 
         // Restart account with new config.
-        match stored.channel_type.as_str() {
+        self.restart_account(&stored.channel_type, account_id, config)
+            .await?;
+
+        info!(account_id, identifier, "sender denied");
+        Ok(serde_json::json!({ "denied": identifier }))
+    }
+}
+
+impl LiveChannelService {
+    /// Restart an account with new config.
+    async fn restart_account(
+        &self,
+        channel_type: &str,
+        account_id: &str,
+        config: Value,
+    ) -> Result<(), String> {
+        match channel_type {
             "telegram" => {
                 let mut tg = self.telegram.write().await;
                 if let Err(e) = tg.stop_account(account_id).await {
-                    warn!(error = %e, account_id, "failed to stop account for sender denial");
+                    warn!(error = %e, account_id, "failed to stop telegram account");
                 }
                 tg.start_account(account_id, config)
                     .await
                     .map_err(|e| e.to_string())?;
             },
+            #[cfg(feature = "whatsapp-business")]
             "whatsapp" => {
                 let mut wa = self.whatsapp.write().await;
                 if let Err(e) = wa.stop_account(account_id).await {
-                    warn!(error = %e, account_id, "failed to stop account for sender denial");
+                    warn!(error = %e, account_id, "failed to stop whatsapp business account");
                 }
                 wa.start_account(account_id, config)
                     .await
                     .map_err(|e| e.to_string())?;
             },
-            _ => return Err(format!("unsupported channel type: {}", stored.channel_type)),
+            #[cfg(feature = "whatsapp-web")]
+            "whatsapp-web" => {
+                let mut wa_web = self.whatsapp_web.write().await;
+                if let Err(e) = wa_web.stop_account(account_id).await {
+                    warn!(error = %e, account_id, "failed to stop whatsapp web account");
+                }
+                wa_web
+                    .start_account(account_id, config)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            },
+            _ => return Err(format!("unsupported channel type: {channel_type}")),
         }
-
-        info!(account_id, identifier, "sender denied");
-        Ok(serde_json::json!({ "denied": identifier }))
+        Ok(())
     }
 }

@@ -24,6 +24,7 @@ members = [
   "crates/telegram",
   "crates/tools",
   "crates/whatsapp",
+  "crates/whatsapp-business",
 ]
 resolver = "2"
 
@@ -93,27 +94,28 @@ rustls-pemfile = "2"
 tokio-rustls   = "0.26"
 
 # Workspace crates
-moltis-agents     = { features = ["provider-github-copilot", "provider-kimi-code", "provider-openai-codex"], path = "crates/agents" }
-moltis-auto-reply = { path = "crates/auto-reply" }
-moltis-browser    = { path = "crates/browser" }
-moltis-canvas     = { path = "crates/canvas" }
-moltis-channels   = { path = "crates/channels" }
-moltis-cli        = { path = "crates/cli" }
-moltis-common     = { path = "crates/common" }
-moltis-config     = { path = "crates/config" }
-moltis-cron       = { path = "crates/cron" }
-moltis-gateway    = { path = "crates/gateway" }
-moltis-mcp        = { path = "crates/mcp" }
-moltis-media      = { path = "crates/media" }
-moltis-memory     = { path = "crates/memory" }
-moltis-oauth      = { path = "crates/oauth" }
-moltis-onboarding = { path = "crates/onboarding" }
-moltis-plugins    = { path = "crates/plugins" }
-moltis-projects   = { path = "crates/projects" }
-moltis-protocol   = { path = "crates/protocol" }
-moltis-routing    = { path = "crates/routing" }
-moltis-sessions   = { path = "crates/sessions" }
-moltis-skills     = { path = "crates/skills" }
-moltis-telegram   = { path = "crates/telegram" }
-moltis-tools      = { path = "crates/tools" }
-moltis-whatsapp   = { path = "crates/whatsapp" }
+moltis-agents            = { features = ["provider-github-copilot", "provider-kimi-code", "provider-openai-codex"], path = "crates/agents" }
+moltis-auto-reply        = { path = "crates/auto-reply" }
+moltis-browser           = { path = "crates/browser" }
+moltis-canvas            = { path = "crates/canvas" }
+moltis-channels          = { path = "crates/channels" }
+moltis-cli               = { path = "crates/cli" }
+moltis-common            = { path = "crates/common" }
+moltis-config            = { path = "crates/config" }
+moltis-cron              = { path = "crates/cron" }
+moltis-gateway           = { path = "crates/gateway" }
+moltis-mcp               = { path = "crates/mcp" }
+moltis-media             = { path = "crates/media" }
+moltis-memory            = { path = "crates/memory" }
+moltis-oauth             = { path = "crates/oauth" }
+moltis-onboarding        = { path = "crates/onboarding" }
+moltis-plugins           = { path = "crates/plugins" }
+moltis-projects          = { path = "crates/projects" }
+moltis-protocol          = { path = "crates/protocol" }
+moltis-routing           = { path = "crates/routing" }
+moltis-sessions          = { path = "crates/sessions" }
+moltis-skills            = { path = "crates/skills" }
+moltis-telegram          = { path = "crates/telegram" }
+moltis-tools             = { path = "crates/tools" }
+moltis-whatsapp          = { path = "crates/whatsapp" }
+moltis-whatsapp-business = { path = "crates/whatsapp-business" }

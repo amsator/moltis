@@ -2057,7 +2057,6 @@ struct NavCounts {
     skills: usize,
     mcp: usize,
     crons: usize,
-    images: usize,
 }
 
 #[cfg(feature = "web-ui")]
@@ -2108,16 +2107,12 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
 
 #[cfg(feature = "web-ui")]
 async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
-    let (projects, models, channels, mcp, crons, images) = tokio::join!(
+    let (projects, models, channels, mcp, crons) = tokio::join!(
         gw.services.project.list(),
         gw.services.model.list(),
         gw.services.channel.status(),
         gw.services.mcp.list(),
         gw.services.cron.list(),
-        async {
-            let builder = moltis_tools::image_cache::DockerImageBuilder::new();
-            builder.list_cached().await.ok()
-        },
     );
 
     let projects = projects
@@ -2204,8 +2199,6 @@ async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
         })
         .unwrap_or(0);
 
-    let images = images.map(|imgs| imgs.len()).unwrap_or(0);
-
     NavCounts {
         projects,
         providers,
@@ -2214,7 +2207,6 @@ async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
         skills,
         mcp,
         crons,
-        images,
     }
 }
 

@@ -15,6 +15,7 @@
 # Features
 
 - [LLM Providers](providers.md)
+  - [Google Gemini](gemini.md)
 - [MCP Servers](mcp.md)
 - [Hooks](hooks.md)
 - [Local LLMs](local-llm.md)

@@ -299,6 +299,41 @@ The WebSocket reader in `websocket.js` dispatches incoming event frames to
 all registered listeners via `eventListeners[frame.event]`. Do **not** use
 `window.addEventListener` / `CustomEvent` for server events — use this bus.
 
+### Client-Side Routing (JS Router)
+
+**Always use the JS router for navigation — never manipulate URLs directly.**
+The router lives in `router.js` and handles page registration, URL changes,
+and cleanup.
+
+```js
+import { navigate, registerPage, registerPrefix } from "./router.js";
+
+// Register a simple page at an exact path
+registerPage("/chat", initFn, teardownFn);
+
+// Register a page that handles a prefix with a parameter
+// e.g. /settings/identity, /settings/security, /channels/list
+registerPrefix("/settings", (container, param) => {
+  // param is the path segment after the prefix (e.g. "identity")
+  activeSection.value = param || "identity";
+  render(html`<${SettingsPage} />`, container);
+}, teardownFn);
+
+// Navigate programmatically (updates URL and triggers page load)
+navigate("/channels/senders");
+```
+
+**Do NOT**:
+- Use `window.location.href = ...` or `window.location.assign()`
+- Use `<a href="...">` without `onClick` that calls `navigate()`
+- Use `history.pushState()` directly (except `replaceState` for URL
+  normalization within a page)
+- Build URLs by string concatenation — use the router's navigate function
+
+The router ensures proper cleanup of the previous page before mounting the
+new one, maintains browser history correctly, and integrates with the app's
+state management.
+
 ## API Namespace Convention
 
 Each navigation tab in the UI should have its own API namespace, both for

@@ -23,6 +23,7 @@ members = [
   "crates/skills",
   "crates/telegram",
   "crates/tools",
+  "crates/whatsapp",
 ]
 resolver = "2"
 
@@ -76,6 +77,8 @@ async-openai = { features = ["chat-completion"], version = "0.32" }
 base64       = "0.22"
 fd-lock      = "4"
 genai        = "0.5"
+hex          = "0.4"
+hmac         = "0.12"
 open         = "5.3"
 rand         = "0.8"
 secrecy      = { features = ["serde"], version = "0.8" }
@@ -113,3 +116,4 @@ moltis-sessions   = { path = "crates/sessions" }
 moltis-skills     = { path = "crates/skills" }
 moltis-telegram   = { path = "crates/telegram" }
 moltis-tools      = { path = "crates/tools" }
+moltis-whatsapp   = { path = "crates/whatsapp" }

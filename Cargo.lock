@@ -2543,6 +2543,7 @@ dependencies = [
  "moltis-skills",
  "moltis-telegram",
  "moltis-tools",
+ "moltis-whatsapp",
  "openssl",
  "password-hash",
  "pulldown-cmark",
@@ -2790,6 +2791,27 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "moltis-whatsapp"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "hex",
+ "hmac",
+ "moltis-channels",
+ "moltis-common",
+ "reqwest 0.12.28",
+ "secrecy 0.8.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

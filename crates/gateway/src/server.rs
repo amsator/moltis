@@ -607,7 +607,8 @@ pub async fn start_gateway(
 
     // Session service is wired after hook registry is built (below).
 
-    // Wire channel store and Telegram channel service.
+    // Wire channel store, Telegram, and WhatsApp channel services.
+    let whatsapp_plugin: Arc<tokio::sync::RwLock<moltis_whatsapp::WhatsAppPlugin>>;
     {
         use moltis_channels::store::ChannelStore;
 
@@ -618,16 +619,23 @@ pub async fn start_gateway(
             crate::channel_store::SqliteChannelStore::new(db_pool.clone()),
         );
 
-        let channel_sink = Arc::new(crate::channel_events::GatewayChannelEventSink::new(
-            Arc::clone(&deferred_state),
-        ));
+        let channel_sink: Arc<dyn moltis_channels::ChannelEventSink> = Arc::new(
+            crate::channel_events::GatewayChannelEventSink::new(Arc::clone(&deferred_state)),
+        );
+
+        // Initialize Telegram plugin.
         let mut tg_plugin = moltis_telegram::TelegramPlugin::new()
             .with_message_log(Arc::clone(&message_log))
-            .with_event_sink(channel_sink);
+            .with_event_sink(Arc::clone(&channel_sink));
 
-        // Start channels from config file (these take precedence).
+        // Initialize WhatsApp plugin.
+        let mut wa_plugin = moltis_whatsapp::WhatsAppPlugin::new()
+            .with_message_log(Arc::clone(&message_log))
+            .with_event_sink(Arc::clone(&channel_sink));
+
+        // Start Telegram channels from config file (these take precedence).
         let tg_accounts = &config.channels.telegram;
-        let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tg_started: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (account_id, account_config) in tg_accounts {
             if let Err(e) = tg_plugin
                 .start_account(account_id, account_config.clone())
@@ -635,7 +643,21 @@ pub async fn start_gateway(
             {
                 tracing::warn!(account_id, "failed to start telegram account: {e}");
             } else {
-                started.insert(account_id.clone());
+                tg_started.insert(account_id.clone());
+            }
+        }
+
+        // Start WhatsApp channels from config file.
+        let wa_accounts = &config.channels.whatsapp;
+        let mut wa_started: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (account_id, account_config) in wa_accounts {
+            if let Err(e) = wa_plugin
+                .start_account(account_id, account_config.clone())
+                .await
+            {
+                tracing::warn!(account_id, "failed to start whatsapp account: {e}");
+            } else {
+                wa_started.insert(account_id.clone());
             }
         }
 
@@ -644,25 +666,60 @@ pub async fn start_gateway(
             Ok(stored) => {
                 info!("{} stored channel(s) found in database", stored.len());
                 for ch in stored {
-                    if started.contains(&ch.account_id) {
-                        info!(
-                            account_id = ch.account_id,
-                            "skipping stored channel (already started from config)"
-                        );
-                        continue;
-                    }
-                    info!(
-                        account_id = ch.account_id,
-                        channel_type = ch.channel_type,
-                        "starting stored channel"
-                    );
-                    if let Err(e) = tg_plugin.start_account(&ch.account_id, ch.config).await {
-                        tracing::warn!(
-                            account_id = ch.account_id,
-                            "failed to start stored telegram account: {e}"
-                        );
-                    } else {
-                        started.insert(ch.account_id);
+                    match ch.channel_type.as_str() {
+                        "telegram" => {
+                            if tg_started.contains(&ch.account_id) {
+                                info!(
+                                    account_id = ch.account_id,
+                                    "skipping stored telegram channel (already started from config)"
+                                );
+                                continue;
+                            }
+                            info!(
+                                account_id = ch.account_id,
+                                channel_type = ch.channel_type,
+                                "starting stored telegram channel"
+                            );
+                            if let Err(e) = tg_plugin.start_account(&ch.account_id, ch.config).await
+                            {
+                                tracing::warn!(
+                                    account_id = ch.account_id,
+                                    "failed to start stored telegram account: {e}"
+                                );
+                            } else {
+                                tg_started.insert(ch.account_id);
+                            }
+                        },
+                        "whatsapp" => {
+                            if wa_started.contains(&ch.account_id) {
+                                info!(
+                                    account_id = ch.account_id,
+                                    "skipping stored whatsapp channel (already started from config)"
+                                );
+                                continue;
+                            }
+                            info!(
+                                account_id = ch.account_id,
+                                channel_type = ch.channel_type,
+                                "starting stored whatsapp channel"
+                            );
+                            if let Err(e) = wa_plugin.start_account(&ch.account_id, ch.config).await
+                            {
+                                tracing::warn!(
+                                    account_id = ch.account_id,
+                                    "failed to start stored whatsapp account: {e}"
+                                );
+                            } else {
+                                wa_started.insert(ch.account_id);
+                            }
+                        },
+                        _ => {
+                            tracing::warn!(
+                                account_id = ch.account_id,
+                                channel_type = ch.channel_type,
+                                "unknown channel type, skipping"
+                            );
+                        },
                     }
                 }
             },
@@ -671,20 +728,29 @@ pub async fn start_gateway(
             },
         }
 
-        if !started.is_empty() {
-            info!("{} telegram account(s) started", started.len());
+        if !tg_started.is_empty() {
+            info!("{} telegram account(s) started", tg_started.len());
+        }
+        if !wa_started.is_empty() {
+            info!("{} whatsapp account(s) started", wa_started.len());
         }
 
-        // Grab shared outbound before moving tg_plugin into the channel service.
+        // Grab shared outbound before moving plugins into the channel service.
         let tg_outbound = tg_plugin.shared_outbound();
         services = services.with_channel_outbound(tg_outbound);
 
-        services.channel = Arc::new(crate::channel::LiveChannelService::new(
+        let live_channel_service = crate::channel::LiveChannelService::new(
             tg_plugin,
+            wa_plugin,
             channel_store,
             Arc::clone(&message_log),
             Arc::clone(&session_metadata),
-        ));
+        );
+
+        // Keep a reference to the WhatsApp plugin for webhook routes.
+        whatsapp_plugin = live_channel_service.whatsapp();
+
+        services.channel = Arc::new(live_channel_service);
     }
 
     services = services.with_session_metadata(Arc::clone(&session_metadata));
@@ -1215,6 +1281,25 @@ pub async fn start_gateway(
 
     #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
     let mut app = build_gateway_app(Arc::clone(&state), Arc::clone(&methods));
+
+    // Add WhatsApp webhook routes.
+    {
+        use axum::{Router, routing::get};
+
+        let wa_state = Arc::new(crate::whatsapp_routes::WhatsAppWebhookState {
+            plugin: whatsapp_plugin,
+        });
+
+        let wa_router = Router::new()
+            .route(
+                "/api/webhooks/whatsapp/:account_id",
+                get(crate::whatsapp_routes::whatsapp_webhook_verify)
+                    .post(crate::whatsapp_routes::whatsapp_webhook_post),
+            )
+            .with_state(wa_state);
+
+        app = app.merge(wa_router);
+    }
 
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
 

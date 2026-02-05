@@ -49,6 +49,10 @@ initMobile();
 // keep the header in sync whenever gon.identity is refreshed.
 applyIdentity(gon.get("identity"));
 gon.onChange("identity", applyIdentity);
+
+// Show git branch banner when running on a non-main branch.
+showBranchBanner(gon.get("git_branch"));
+gon.onChange("git_branch", showBranchBanner);
 onEvent("session", (payload) => {
 	fetchSessions();
 	if (payload && payload.kind === "patched" && payload.sessionKey === S.activeSessionKey) {
@@ -92,6 +96,17 @@ function showAuthDisabledBanner() {
 function showOnboardingBanner() {
 	var el = document.getElementById("onboardingBanner");
 	if (el) el.style.display = "";
+}
+
+function showBranchBanner(branch) {
+	var el = document.getElementById("branchBanner");
+	if (!el) return;
+	if (branch) {
+		document.getElementById("branchName").textContent = branch;
+		el.style.display = "";
+	} else {
+		el.style.display = "none";
+	}
 }
 
 function applyIdentity(identity) {

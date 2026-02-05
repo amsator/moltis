@@ -1958,6 +1958,11 @@ async fn run_streaming(
                     BroadcastOpts::default(),
                 )
                 .await;
+                // Send push notification when chat response completes
+                #[cfg(feature = "push-notifications")]
+                {
+                    send_chat_push_notification(state, session_key, &accumulated).await;
+                }
                 deliver_channel_replies(state, session_key, &accumulated).await;
                 return Some((accumulated, usage.input_tokens, usage.output_tokens));
             },
@@ -1986,6 +1991,48 @@ async fn run_streaming(
         }
     }
     None
+}
+
+/// Send a push notification when a chat response completes.
+/// Only sends if push notifications are configured and there are subscribers.
+#[cfg(feature = "push-notifications")]
+async fn send_chat_push_notification(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    text: &str,
+) {
+    let push_service = match state.get_push_service().await {
+        Some(svc) => svc,
+        None => return,
+    };
+
+    // Don't send if there are no subscribers
+    if push_service.subscription_count().await == 0 {
+        return;
+    }
+
+    // Create a short summary of the response (first 100 chars)
+    let summary = if text.len() > 100 {
+        format!("{}…", &text[..100])
+    } else {
+        text.to_string()
+    };
+
+    // Build the notification
+    let title = "Message received";
+    let url = format!("/chat/{session_key}");
+
+    if let Err(e) = crate::push_routes::send_push_notification(
+        &push_service,
+        title,
+        &summary,
+        Some(&url),
+        Some(session_key),
+    )
+    .await
+    {
+        tracing::warn!("Failed to send push notification: {e}");
+    }
 }
 
 /// Drain any pending channel reply targets for a session and send the

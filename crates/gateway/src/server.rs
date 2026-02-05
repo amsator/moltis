@@ -1472,6 +1472,8 @@ pub async fn start_gateway(
         match crate::push::PushService::new(&data_dir).await {
             Ok(svc) => {
                 info!("push notification service initialized");
+                // Store in GatewayState for use by chat service
+                state.set_push_service(Arc::clone(&svc)).await;
                 Some(svc)
             },
             Err(e) => {

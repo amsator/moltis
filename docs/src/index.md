@@ -43,11 +43,13 @@ moltis
 ```
 
 On first launch:
-1. A setup code appears in the terminal
-2. Open the URL shown in your browser
-3. Enter the code and set up authentication
-4. Add your LLM API key
-5. Start chatting!
+1. Open the URL shown in your browser (e.g., `http://localhost:13131`)
+2. Add your LLM API key
+3. Start chatting!
+
+```admonish note
+Authentication is only required when accessing Moltis from a non-localhost address. On localhost, you can start using it immediately.
+```
 
 → [Full Quickstart Guide](quickstart.md)
 
@@ -104,7 +106,7 @@ On first launch:
 
 Moltis applies defense in depth:
 
-- **Authentication** — Password or passkey (WebAuthn) with session cookies
+- **Authentication** — Password or passkey (WebAuthn) required for non-localhost access
 - **SSRF Protection** — Blocks requests to internal networks
 - **Secret Handling** — `secrecy::Secret` zeroes memory on drop
 - **Sandboxed Execution** — Commands never run on the host

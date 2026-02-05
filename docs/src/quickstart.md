@@ -24,19 +24,10 @@ You'll see output like:
 
 ```
 🚀 Moltis gateway starting...
-📋 Setup code: ABC123
 🌐 Open http://localhost:13131 in your browser
 ```
 
-## 3. Setup
-
-1. Open the URL in your browser
-2. Enter the setup code shown in the terminal
-3. Choose authentication:
-   - **Password** — traditional username/password
-   - **Passkey** — biometric/hardware key (recommended)
-
-## 4. Configure a Provider
+## 3. Configure a Provider
 
 You need an LLM API key to chat. The easiest options:
 
@@ -58,7 +49,7 @@ You need an LLM API key to chat. The easiest options:
 2. Pull a model: `ollama pull llama3.2`
 3. In Moltis, configure Ollama in **Settings** → **Providers**
 
-## 5. Chat!
+## 4. Chat!
 
 Go to the **Chat** tab and start a conversation:
 

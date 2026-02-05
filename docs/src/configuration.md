@@ -97,6 +97,10 @@ watch_dirs = [
 
 ## Authentication
 
+Authentication is **only required when accessing Moltis from a non-localhost address**. When running on `localhost` or `127.0.0.1`, no authentication is needed by default.
+
+When you access Moltis from a network address (e.g., `http://192.168.1.100:13131`), a one-time setup code is printed to the terminal. Use it to set up a password or passkey.
+
 ```toml
 [auth]
 disabled = false                # Set true to disable auth entirely
@@ -106,7 +110,7 @@ session_expiry = 604800         # Session lifetime in seconds (7 days)
 ```
 
 ```admonish warning
-Only disable authentication if Moltis is running on a trusted private network. Never expose an unauthenticated instance to the internet.
+Only set `disabled = true` if Moltis is running on a trusted private network. Never expose an unauthenticated instance to the internet.
 ```
 
 ## Hooks

@@ -63,6 +63,9 @@ async fn start_auth_server_impl(
     );
     let state_clone = Arc::clone(&state);
     let methods = Arc::new(MethodRegistry::new());
+    #[cfg(feature = "push-notifications")]
+    let app = build_gateway_app(state, methods, None);
+    #[cfg(not(feature = "push-notifications"))]
     let app = build_gateway_app(state, methods);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -88,6 +91,9 @@ async fn start_noauth_server() -> SocketAddr {
         Arc::new(moltis_tools::approval::ApprovalManager::default()),
     );
     let methods = Arc::new(MethodRegistry::new());
+    #[cfg(feature = "push-notifications")]
+    let app = build_gateway_app(state, methods, None);
+    #[cfg(not(feature = "push-notifications"))]
     let app = build_gateway_app(state, methods);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

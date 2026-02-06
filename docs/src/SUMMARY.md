@@ -21,6 +21,7 @@
 - [Sandbox](sandbox.md)
 - [Agent Presets](agent-presets.md)
 - [Session Tools](session-tools.md)
+- [Mobile PWA](mobile-pwa.md)
 
 ---
 

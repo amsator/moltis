@@ -26,6 +26,24 @@ default = ["foo", ...]  # Add to defaults
 foo = ["moltis-gateway/foo"]  # Forward to gateway
 ```
 
+## Workspace Dependencies
+
+**Always add new third-party crates to `[workspace.dependencies]` in the
+root `Cargo.toml`**, then reference them with `{ workspace = true }` in
+each crate's `Cargo.toml`. Never add a version directly in a crate's
+`Cargo.toml` — centralising versions in the workspace avoids duplicate
+versions in the lock file and makes upgrades easier.
+
+```toml
+# Root Cargo.toml
+[workspace.dependencies]
+some-crate = "1.2"
+
+# crates/gateway/Cargo.toml
+[dependencies]
+some-crate = { workspace = true }
+```
+
 ## Rust Style and Idioms
 
 Write idiomatic, Rustacean code. Prioritize clarity, modularity, and
@@ -566,6 +584,23 @@ When entering plan mode, plans are automatically saved there. After completing
 a significant piece of work, write a brief session summary to
 `prompts/session-YYYY-MM-DD-<topic>.md` capturing what was done, key decisions,
 and any open items.
+
+## Changelog
+
+This project keeps a changelog at `CHANGELOG.md` following
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). When making
+user-facing changes, **always** update the `[Unreleased]` section with a
+bullet under the appropriate heading:
+
+- **Added** — new features
+- **Changed** — changes in existing functionality
+- **Deprecated** — soon-to-be removed features
+- **Removed** — now removed features
+- **Fixed** — bug fixes
+- **Security** — vulnerability fixes
+
+At release time the `[Unreleased]` section is renamed to the version number
+with a date.
 
 ## Git Workflow
 

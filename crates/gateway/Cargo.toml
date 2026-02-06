@@ -51,6 +51,7 @@ serde                 = { workspace = true }
 serde_json            = { workspace = true }
 sha2                  = { workspace = true }
 sqlx                  = { workspace = true }
+sysinfo               = { workspace = true }
 time                  = { optional = true, workspace = true }
 tokio                 = { workspace = true }
 tokio-rustls          = { optional = true, workspace = true }
@@ -80,7 +81,7 @@ default = [
   "tls",
   "web-ui",
 ]
-file-watcher = ["moltis-memory/file-watcher"]
+file-watcher = ["moltis-memory/file-watcher", "moltis-skills/file-watcher"]
 local-embeddings = ["moltis-memory/local-embeddings"]
 local-llm = ["moltis-agents/local-llm"]
 local-llm-cuda = ["moltis-agents/local-llm-cuda"]

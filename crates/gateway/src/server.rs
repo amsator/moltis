@@ -549,6 +549,9 @@ pub async fn start_gateway(
         Arc::new(moltis_projects::SqliteProjectStore::new(db_pool.clone()));
     let session_store = Arc::new(SessionStore::new(sessions_dir));
     let session_metadata = Arc::new(SqliteSessionMetadata::new(db_pool.clone()));
+    let session_state_store = Arc::new(moltis_sessions::state_store::SessionStateStore::new(
+        db_pool.clone(),
+    ));
 
     // Session service wired below after sandbox_router is created.
 
@@ -976,7 +979,8 @@ pub async fn start_gateway(
         let mut session_svc =
             LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
                 .with_sandbox_router(Arc::clone(&sandbox_router))
-                .with_project_store(Arc::clone(&project_store));
+                .with_project_store(Arc::clone(&project_store))
+                .with_state_store(Arc::clone(&session_state_store));
         if let Some(ref hooks) = hook_registry {
             session_svc = session_svc.with_hooks(Arc::clone(hooks));
         }
@@ -1416,6 +1420,34 @@ pub async fn start_gateway(
             )));
         }
 
+        // Register session state tool for per-session persistent KV store.
+        tool_registry.register(Box::new(
+            moltis_tools::session_state::SessionStateTool::new(Arc::clone(&session_state_store)),
+        ));
+
+        // Register skill management tools for agent self-extension.
+        // Use data_dir so created skills land in ~/.moltis/skills/ (Personal
+        // source), which is always discovered regardless of the gateway's cwd.
+        {
+            tool_registry.register(Box::new(moltis_tools::skill_tools::CreateSkillTool::new(
+                data_dir.clone(),
+            )));
+            tool_registry.register(Box::new(moltis_tools::skill_tools::UpdateSkillTool::new(
+                data_dir.clone(),
+            )));
+            tool_registry.register(Box::new(moltis_tools::skill_tools::DeleteSkillTool::new(
+                data_dir.clone(),
+            )));
+        }
+
+        // Register branch session tool for session forking.
+        tool_registry.register(Box::new(
+            moltis_tools::branch_session::BranchSessionTool::new(
+                Arc::clone(&session_store),
+                Arc::clone(&session_metadata),
+            ),
+        ));
+
         // Register spawn_agent tool for sub-agent support.
         // The tool gets a snapshot of the current registry (without itself)
         // so sub-agents have access to all other tools.
@@ -1486,6 +1518,30 @@ pub async fn start_gateway(
             .set_tool_registry(Arc::clone(&shared_tool_registry))
             .await;
         crate::mcp_service::sync_mcp_tools(live_mcp.manager(), &shared_tool_registry).await;
+    }
+
+    // Spawn skill file watcher for hot-reload.
+    #[cfg(feature = "file-watcher")]
+    {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
+        let watch_dirs: Vec<std::path::PathBuf> =
+            search_paths.into_iter().map(|(p, _)| p).collect();
+        if let Ok((_watcher, mut rx)) = moltis_skills::watcher::SkillWatcher::start(watch_dirs) {
+            let watcher_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let _watcher = _watcher; // keep alive
+                while let Some(_event) = rx.recv().await {
+                    broadcast(
+                        &watcher_state,
+                        "skills.changed",
+                        serde_json::json!({}),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+                }
+            });
+        }
     }
 
     // Spawn MCP health polling + auto-restart background task.
@@ -1758,9 +1814,28 @@ pub async fn start_gateway(
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(TICK_INTERVAL_MS));
+        let mut sys = sysinfo::System::new();
+        let pid = sysinfo::get_current_pid().ok();
         loop {
             interval.tick().await;
-            broadcast_tick(&tick_state).await;
+            sys.refresh_memory();
+            if let Some(pid) = pid {
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    false,
+                    sysinfo::ProcessRefreshKind::nothing().with_memory(),
+                );
+            }
+            let process_mem = pid
+                .and_then(|p| sys.process(p))
+                .map(|p| p.memory())
+                .unwrap_or(0);
+            let total = sys.total_memory();
+            let available = match sys.available_memory() {
+                0 => total.saturating_sub(sys.used_memory()),
+                v => v,
+            };
+            broadcast_tick(&tick_state, process_mem, available, total).await;
         }
     });
 
@@ -2228,6 +2303,47 @@ struct GonData {
     /// Non-main git branch name, if running from a git checkout on a
     /// non-default branch. `None` when on `main`/`master` or outside a repo.
     git_branch: Option<String>,
+    /// Memory stats snapshot (process RSS + system available/total).
+    mem: MemSnapshot,
+}
+
+/// Memory snapshot included in gon data and tick broadcasts.
+#[cfg(feature = "web-ui")]
+#[derive(serde::Serialize)]
+struct MemSnapshot {
+    process: u64,
+    available: u64,
+    total: u64,
+}
+
+/// Collect a point-in-time memory snapshot (process RSS + system memory).
+#[cfg(feature = "web-ui")]
+fn collect_mem_snapshot() -> MemSnapshot {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let pid = sysinfo::get_current_pid().ok();
+    if let Some(pid) = pid {
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            false,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
+    }
+    let process = pid
+        .and_then(|p| sys.process(p))
+        .map(|p| p.memory())
+        .unwrap_or(0);
+    let total = sys.total_memory();
+    // available_memory() returns 0 on macOS; fall back to total − used.
+    let available = match sys.available_memory() {
+        0 => total.saturating_sub(sys.used_memory()),
+        v => v,
+    };
+    MemSnapshot {
+        process,
+        available,
+        total,
+    }
 }
 
 /// Detect the current git branch, returning `None` for `main`/`master` or
@@ -2343,6 +2459,7 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
         heartbeat_config,
         heartbeat_runs,
         git_branch: detect_git_branch(),
+        mem: collect_mem_snapshot(),
     }
 }
 
@@ -2582,7 +2699,7 @@ fn enabled_from_manifest(
         .unwrap_or_default()
 }
 
-/// Skills endpoint: repos and enabled skills from the skills manifest only.
+/// Skills endpoint: repos, enabled registry skills, and discovered personal/project skills.
 #[cfg(feature = "web-ui")]
 async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse {
     let repos = state
@@ -2595,7 +2712,37 @@ async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse 
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    let skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
+    let mut skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
+
+    // Also include discovered Personal and Project skills (not in the manifest).
+    {
+        use moltis_skills::discover::{FsSkillDiscoverer, SkillDiscoverer};
+        let data_dir = moltis_config::data_dir();
+        let search_paths = vec![
+            (
+                data_dir.join("skills"),
+                moltis_skills::types::SkillSource::Personal,
+            ),
+            // Project-local skills if gateway was started from a project directory.
+            (
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(".moltis/skills"),
+                moltis_skills::types::SkillSource::Project,
+            ),
+        ];
+        let discoverer = FsSkillDiscoverer::new(search_paths);
+        if let Ok(discovered) = discoverer.discover().await {
+            for s in discovered {
+                skills.push(serde_json::json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "source": s.source,
+                    "enabled": true,
+                }));
+            }
+        }
+    }
 
     Json(serde_json::json!({ "skills": skills, "repos": repos }))
 }

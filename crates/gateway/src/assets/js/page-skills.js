@@ -298,7 +298,10 @@ function SkillDetail(props) {
 	function onToggle() {
 		if (!S.connected) return;
 		if (isDisc && d.enabled) {
-			requestConfirm(`Delete skill "${d.name}"? This removes the SKILL.md file.`).then((yes) => {
+			requestConfirm(`Delete skill "${d.name}"? This removes the SKILL.md file.`, {
+				confirmLabel: "Delete",
+				danger: true,
+			}).then((yes) => {
 				if (yes) doToggle();
 			});
 			return;
@@ -530,7 +533,10 @@ function EnabledSkillsTable() {
 			return;
 		}
 		if (isDiscovered(skill)) {
-			requestConfirm(`Delete skill "${skill.name}"? This removes the SKILL.md file.`).then((yes) => {
+			requestConfirm(`Delete skill "${skill.name}"? This removes the SKILL.md file.`, {
+				confirmLabel: "Delete",
+				danger: true,
+			}).then((yes) => {
 				if (yes) doDisable(skill);
 			});
 			return;

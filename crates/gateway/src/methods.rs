@@ -2209,6 +2209,19 @@ impl MethodRegistry {
                 })
             }),
         );
+        self.register(
+            "skills.skill.save",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .skills
+                        .skill_save(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
 
         // Plugins
         self.register(

@@ -17,7 +17,7 @@ import { fetchModels } from "./models.js";
 import { prefetchChannels } from "./page-channels.js";
 import { renderCompactCard } from "./page-chat.js";
 import { fetchProjects } from "./projects.js";
-import { currentPage, currentPrefix, mount } from "./router.js";
+import { currentPage, currentPrefix, mount, navigate } from "./router.js";
 import {
 	appendLastMessageTimestamp,
 	bumpSessionCount,
@@ -129,6 +129,21 @@ function handleChatToolCallEnd(p, isActive, isChatPage) {
 		errMsg.className = "exec-error-detail";
 		errMsg.textContent = p.error.detail;
 		toolCard.appendChild(errMsg);
+	}
+	// Show a hint below the card when a skill is created or updated.
+	if (p.success && (p.toolName === "create_skill" || p.toolName === "update_skill")) {
+		var hint = document.createElement("div");
+		hint.className = "skill-hint";
+		var verb = p.toolName === "create_skill" ? "created" : "updated";
+		var link = document.createElement("a");
+		link.href = "/skills";
+		link.textContent = "personal skills";
+		link.addEventListener("click", (e) => {
+			e.preventDefault();
+			navigate("/skills");
+		});
+		hint.append(`Skill ${verb} \u2014 available in your `, link);
+		toolCard.appendChild(hint);
 	}
 }
 

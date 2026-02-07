@@ -152,7 +152,7 @@ async fn handle_message(
         let entry = MessageLogEntry {
             id: 0,
             account_id: account_id.to_string(),
-            channel_type: "xmpp".into(),
+            channel_type: "xmpp".to_string(),
             peer_id: peer_jid.clone(),
             username: username.clone(),
             sender_name: sender_name.clone(),
@@ -170,7 +170,7 @@ async fn handle_message(
     // Emit channel event for real-time UI updates.
     if let Some(sink) = event_sink {
         sink.emit(ChannelEvent::InboundMessage {
-            channel_type: "xmpp".into(),
+            channel_type: moltis_channels::ChannelType::Xmpp,
             account_id: account_id.to_string(),
             peer_id: peer_jid.clone(),
             username: username.clone(),
@@ -196,7 +196,7 @@ async fn handle_message(
         && !cleaned_body.is_empty()
     {
         let reply_target = ChannelReplyTarget {
-            channel_type: "xmpp".into(),
+            channel_type: moltis_channels::ChannelType::Xmpp,
             account_id: account_id.to_string(),
             chat_id: chat_id.clone(),
         };
@@ -234,7 +234,7 @@ async fn handle_message(
         }
 
         let meta = ChannelMessageMeta {
-            channel_type: "xmpp".into(),
+            channel_type: moltis_channels::ChannelType::Xmpp,
             sender_name: sender_name.clone(),
             username: username.clone(),
             model: config.model.clone(),

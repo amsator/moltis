@@ -4,6 +4,45 @@ use {
     anyhow::Result, async_trait::async_trait, moltis_common::types::ReplyPayload, tokio::sync::mpsc,
 };
 
+// ── Channel type enum ───────────────────────────────────────────────────────
+
+/// Supported channel types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelType {
+    Telegram,
+    Xmpp,
+    // Future: Discord, Slack, WhatsApp, etc.
+}
+
+impl ChannelType {
+    /// Returns the channel type identifier as a string slice.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Telegram => "telegram",
+            Self::Xmpp => "xmpp",
+        }
+    }
+}
+
+impl std::fmt::Display for ChannelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ChannelType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "telegram" => Ok(Self::Telegram),
+            "xmpp" => Ok(Self::Xmpp),
+            other => Err(format!("unknown channel type: {other}")),
+        }
+    }
+}
+
 // ── Channel events (pub/sub) ────────────────────────────────────────────────
 
 /// Events emitted by channel plugins for real-time UI updates.
@@ -11,7 +50,7 @@ use {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelEvent {
     InboundMessage {
-        channel_type: String,
+        channel_type: ChannelType,
         account_id: String,
         peer_id: String,
         username: Option<String>,
@@ -21,9 +60,27 @@ pub enum ChannelEvent {
     },
     /// A channel account was automatically disabled due to a runtime error.
     AccountDisabled {
-        channel_type: String,
+        channel_type: ChannelType,
         account_id: String,
         reason: String,
+    },
+    /// An OTP challenge was issued to a non-allowlisted DM user.
+    OtpChallenge {
+        channel_type: ChannelType,
+        account_id: String,
+        peer_id: String,
+        username: Option<String>,
+        sender_name: Option<String>,
+        code: String,
+        expires_at: i64,
+    },
+    /// An OTP challenge was resolved (approved, locked out, or expired).
+    OtpResolved {
+        channel_type: ChannelType,
+        account_id: String,
+        peer_id: String,
+        username: Option<String>,
+        resolution: String,
     },
 }
 
@@ -56,12 +113,24 @@ pub trait ChannelEventSink: Send + Sync {
     /// This is used when the polling loop detects an unrecoverable error
     /// (e.g. another bot instance is running with the same token).
     async fn request_disable_account(&self, channel_type: &str, account_id: &str, reason: &str);
+
+    /// Request adding a sender to the allowlist (OTP self-approval).
+    ///
+    /// The gateway implementation calls `sender_approve` to persist the change
+    /// and restart the account.
+    async fn request_sender_approval(
+        &self,
+        _channel_type: &str,
+        _account_id: &str,
+        _identifier: &str,
+    ) {
+    }
 }
 
 /// Metadata about a channel message, used for UI display.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChannelMessageMeta {
-    pub channel_type: String,
+    pub channel_type: ChannelType,
     pub sender_name: Option<String>,
     pub username: Option<String>,
     /// Default model configured for this channel account.
@@ -72,7 +141,7 @@ pub struct ChannelMessageMeta {
 /// Where to send the LLM response back.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChannelReplyTarget {
-    pub channel_type: String,
+    pub channel_type: ChannelType,
     pub account_id: String,
     /// Chat/peer ID to send the reply to.
     pub chat_id: String,
@@ -107,6 +176,13 @@ pub trait ChannelPlugin: Send + Sync {
 
     /// Get the config for a specific account as JSON.
     fn account_config(&self, account_id: &str) -> Option<serde_json::Value>;
+
+    /// List pending OTP/verification challenges for an account.
+    /// Returns a list of JSON objects with challenge details.
+    /// Default: empty (no OTP support).
+    fn pending_otp_challenges(&self, _account_id: &str) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
 }
 
 /// Send messages to a channel.
@@ -117,6 +193,10 @@ pub trait ChannelOutbound: Send + Sync {
     /// Send a "typing" indicator. No-op by default.
     async fn send_typing(&self, _account_id: &str, _to: &str) -> Result<()> {
         Ok(())
+    }
+    /// Send a text message without notification (silent). Falls back to send_text by default.
+    async fn send_text_silent(&self, account_id: &str, to: &str, text: &str) -> Result<()> {
+        self.send_text(account_id, to, text).await
     }
 }
 

@@ -333,6 +333,23 @@ impl ChannelService for LiveChannelService {
             .unwrap_or_default();
         drop(reg);
 
+        // Query pending OTP challenges for this account via the plugin trait.
+        let otp_challenges: Vec<serde_json::Value> = {
+            let reg = self.registry.read().await;
+            reg.list()
+                .iter()
+                .find_map(|pid| {
+                    reg.get(pid).and_then(|p| {
+                        if p.account_ids().contains(&account_id.to_string()) {
+                            Some(p.pending_otp_challenges(account_id))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_default()
+        };
+
         let list: Vec<Value> = senders
             .into_iter()
             .map(|s| {
@@ -343,14 +360,25 @@ impl ChannelService for LiveChannelService {
                             .as_ref()
                             .is_some_and(|u| a_lower == u.to_lowercase())
                 });
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "peer_id": s.peer_id,
                     "username": s.username,
                     "sender_name": s.sender_name,
                     "message_count": s.message_count,
                     "last_seen": s.last_seen,
                     "allowed": is_allowed,
-                })
+                });
+                // Attach OTP info if a challenge is pending for this peer.
+                if let Some(otp) = otp_challenges
+                    .iter()
+                    .find(|c| c.get("peer_id").and_then(|v| v.as_str()) == Some(&s.peer_id))
+                {
+                    entry["otp_pending"] = serde_json::json!({
+                        "code": otp.get("code"),
+                        "expires_at": otp.get("expires_at"),
+                    });
+                }
+                entry
             })
             .collect();
 

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Google Gemini Provider**: Native Gemini API integration with two authentication methods:
+  - **API Key** (`gemini`): Direct authentication via `GEMINI_API_KEY` environment variable
+  - **OAuth** (`gemini-oauth`): Browser-based Authorization Code + PKCE flow where users authenticate with their Google account (API usage billed to user's account, not application developer)
+  - Full tool/function calling support with automatic JSON Schema type conversion
+  - Streaming via Server-Sent Events
+  - System instruction support
+  - All models support 1M token context window
 - **Hooks Web UI**: New `/hooks` page to manage lifecycle hooks from the browser
   - View all discovered hooks with eligibility status, source, and events
   - Enable/disable hooks without removing files (persisted across restarts)

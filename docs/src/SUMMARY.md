@@ -38,6 +38,7 @@
 # Deployment
 
 - [Docker](docker.md)
+- [Cloud Deploy](cloud-deploy.md)
 
 ---
 
@@ -47,3 +48,9 @@
 - [SQLite Migrations](sqlite-migration.md)
 - [Metrics & Tracing](metrics-and-tracing.md)
 - [Tool Registry](tool-registry.md)
+
+---
+
+# Reference
+
+- [Changelog](changelog.md)

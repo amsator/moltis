@@ -10,6 +10,7 @@ pub mod env_subst;
 pub mod loader;
 pub mod migrate;
 pub mod schema;
+pub mod validate;
 
 pub use {
     loader::{
@@ -22,4 +23,5 @@ pub use {
         MessageQueueMode, MoltisConfig, PresetHookConfig, PresetMemoryConfig, ResolvedIdentity,
         SessionAccessPolicyConfig, UserProfile,
     },
+    validate::{Diagnostic, Severity, ValidationResult},
 };

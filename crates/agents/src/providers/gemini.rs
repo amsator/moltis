@@ -4,7 +4,9 @@ use {async_trait::async_trait, futures::StreamExt, secrecy::ExposeSecret, tokio_
 
 use tracing::{debug, trace, warn};
 
-use crate::model::{CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage};
+use crate::model::{
+    ChatMessage, CompletionResponse, LlmProvider, StreamEvent, ToolCall, Usage, UserContent,
+};
 
 /// Information about a Gemini model returned from the API.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -197,15 +199,13 @@ fn convert_json_schema_types(schema: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Extract system instruction from messages, returning (system_text, remaining_messages).
-fn extract_system_instruction(
-    messages: &[serde_json::Value],
-) -> (Option<String>, Vec<&serde_json::Value>) {
+fn extract_system_instruction(messages: &[ChatMessage]) -> (Option<String>, Vec<&ChatMessage>) {
     let mut system_text = None;
     let mut remaining = Vec::new();
 
     for msg in messages {
-        if msg["role"].as_str() == Some("system") {
-            system_text = msg["content"].as_str().map(|s| s.to_string());
+        if let ChatMessage::System { content } = msg {
+            system_text = Some(content.clone());
         } else {
             remaining.push(msg);
         }
@@ -220,82 +220,96 @@ fn extract_system_instruction(
 /// - role: "user" for user messages and tool results
 /// - role: "model" for assistant messages
 /// - parts: array of { text: "..." } or { functionCall: {...} } or { functionResponse: {...} }
-fn to_gemini_messages(messages: &[&serde_json::Value]) -> Vec<serde_json::Value> {
+fn to_gemini_messages(messages: &[&ChatMessage]) -> Vec<serde_json::Value> {
     messages
         .iter()
-        .map(|msg| {
-            let role = msg["role"].as_str().unwrap_or("user");
-
-            match role {
-                "assistant" => {
-                    // Check if this assistant message has tool_calls
-                    if let Some(tool_calls) = msg["tool_calls"].as_array() {
-                        let mut parts = Vec::new();
-
-                        // Add text content if present
-                        if let Some(text) = msg["content"].as_str()
-                            && !text.is_empty()
-                        {
-                            parts.push(serde_json::json!({ "text": text }));
-                        }
-
-                        // Add function calls
-                        for tc in tool_calls {
-                            let name = tc["function"]["name"].as_str().unwrap_or("");
-                            // Arguments come as a JSON string, parse it
-                            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                            let args: serde_json::Value =
-                                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                            parts.push(serde_json::json!({
-                                "functionCall": {
-                                    "name": name,
-                                    "args": args,
-                                }
-                            }));
-                        }
-
-                        serde_json::json!({
-                            "role": "model",
-                            "parts": parts,
+        .map(|msg| match msg {
+            ChatMessage::System { .. } => {
+                // System messages are handled separately via systemInstruction
+                // This shouldn't be called with system messages, but handle gracefully
+                serde_json::json!({
+                    "role": "user",
+                    "parts": [{ "text": "" }],
+                })
+            },
+            ChatMessage::User { content } => {
+                let parts = match content {
+                    UserContent::Text(text) => {
+                        vec![serde_json::json!({ "text": text })]
+                    },
+                    UserContent::Multimodal(parts) => parts
+                        .iter()
+                        .map(|p| match p {
+                            crate::model::ContentPart::Text(text) => {
+                                serde_json::json!({ "text": text })
+                            },
+                            crate::model::ContentPart::Image { media_type, data } => {
+                                serde_json::json!({
+                                    "inlineData": {
+                                        "mimeType": media_type,
+                                        "data": data,
+                                    }
+                                })
+                            },
                         })
-                    } else {
-                        // Regular text assistant message
-                        serde_json::json!({
-                            "role": "model",
-                            "parts": [{ "text": msg["content"].as_str().unwrap_or("") }],
-                        })
-                    }
-                },
-                "tool" => {
-                    // Tool result message - convert to functionResponse
-                    let tool_call_id = msg["tool_call_id"].as_str().unwrap_or("");
-                    let content = msg["content"].as_str().unwrap_or("");
+                        .collect(),
+                };
+                serde_json::json!({
+                    "role": "user",
+                    "parts": parts,
+                })
+            },
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let mut parts = Vec::new();
 
-                    // Try to parse content as JSON, fall back to wrapping as text
-                    let response: serde_json::Value = serde_json::from_str(content)
-                        .unwrap_or_else(|_| serde_json::json!({ "result": content }));
+                // Add text content if present
+                if let Some(text) = content
+                    && !text.is_empty()
+                {
+                    parts.push(serde_json::json!({ "text": text }));
+                }
 
-                    // Gemini expects functionResponse with name, but we have tool_call_id
-                    // The tool_call_id in our format contains the function name
-                    // We'll use it as the name since Gemini uses name, not id
-                    serde_json::json!({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": tool_call_id,
-                                "response": response,
-                            }
-                        }],
-                    })
-                },
-                // "user" or any other role
-                _ => {
-                    serde_json::json!({
-                        "role": "user",
-                        "parts": [{ "text": msg["content"].as_str().unwrap_or("") }],
-                    })
-                },
-            }
+                // Add function calls
+                for tc in tool_calls {
+                    parts.push(serde_json::json!({
+                        "functionCall": {
+                            "name": &tc.name,
+                            "args": &tc.arguments,
+                        }
+                    }));
+                }
+
+                // If no parts, add empty text to avoid empty parts array
+                if parts.is_empty() {
+                    parts.push(serde_json::json!({ "text": "" }));
+                }
+
+                serde_json::json!({
+                    "role": "model",
+                    "parts": parts,
+                })
+            },
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                // Try to parse content as JSON, fall back to wrapping as text
+                let response: serde_json::Value = serde_json::from_str(content)
+                    .unwrap_or_else(|_| serde_json::json!({ "result": content }));
+
+                serde_json::json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": tool_call_id,
+                            "response": response,
+                        }
+                    }],
+                })
+            },
         })
         .collect()
 }
@@ -355,7 +369,7 @@ impl LlmProvider for GeminiProvider {
 
     async fn complete(
         &self,
-        messages: &[serde_json::Value],
+        messages: &[ChatMessage],
         tools: &[serde_json::Value],
     ) -> anyhow::Result<CompletionResponse> {
         // Extract system instruction and convert remaining messages
@@ -440,13 +454,12 @@ impl LlmProvider for GeminiProvider {
     #[allow(clippy::collapsible_if)]
     fn stream(
         &self,
-        messages: Vec<serde_json::Value>,
+        messages: Vec<ChatMessage>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
         Box::pin(async_stream::stream! {
             // Extract system instruction and convert messages
             let (system_text, conv_messages) = extract_system_instruction(&messages);
-            let conv_refs: Vec<&serde_json::Value> = conv_messages.into_iter().collect();
-            let gemini_messages = to_gemini_messages(&conv_refs);
+            let gemini_messages = to_gemini_messages(&conv_messages);
 
             let mut body = serde_json::json!({
                 "contents": gemini_messages,
@@ -609,22 +622,22 @@ mod tests {
     #[test]
     fn extract_system_instruction_separates_system_message() {
         let messages = vec![
-            serde_json::json!({ "role": "system", "content": "You are helpful" }),
-            serde_json::json!({ "role": "user", "content": "Hello" }),
-            serde_json::json!({ "role": "assistant", "content": "Hi there" }),
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there"),
         ];
 
         let (system, remaining) = extract_system_instruction(&messages);
 
         assert_eq!(system, Some("You are helpful".to_string()));
         assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0]["role"], "user");
-        assert_eq!(remaining[1]["role"], "assistant");
+        assert!(matches!(remaining[0], ChatMessage::User { .. }));
+        assert!(matches!(remaining[1], ChatMessage::Assistant { .. }));
     }
 
     #[test]
     fn to_gemini_messages_converts_user_message() {
-        let msg = serde_json::json!({ "role": "user", "content": "Hello" });
+        let msg = ChatMessage::user("Hello");
         let messages = vec![&msg];
 
         let gemini = to_gemini_messages(&messages);
@@ -636,7 +649,7 @@ mod tests {
 
     #[test]
     fn to_gemini_messages_converts_assistant_message() {
-        let msg = serde_json::json!({ "role": "assistant", "content": "Hi there" });
+        let msg = ChatMessage::assistant("Hi there");
         let messages = vec![&msg];
 
         let gemini = to_gemini_messages(&messages);
@@ -648,17 +661,11 @@ mod tests {
 
     #[test]
     fn to_gemini_messages_converts_assistant_with_tool_calls() {
-        let msg = serde_json::json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "call_123",
-                "function": {
-                    "name": "get_weather",
-                    "arguments": "{\"location\": \"Boston\"}"
-                }
-            }]
-        });
+        let msg = ChatMessage::assistant_with_tools(None, vec![ToolCall {
+            id: "call_123".into(),
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"location": "Boston"}),
+        }]);
         let messages = vec![&msg];
 
         let gemini = to_gemini_messages(&messages);
@@ -673,11 +680,7 @@ mod tests {
 
     #[test]
     fn to_gemini_messages_converts_tool_result() {
-        let msg = serde_json::json!({
-            "role": "tool",
-            "tool_call_id": "get_weather",
-            "content": "{\"temperature\": 72}"
-        });
+        let msg = ChatMessage::tool("get_weather", r#"{"temperature": 72}"#);
         let messages = vec![&msg];
 
         let gemini = to_gemini_messages(&messages);

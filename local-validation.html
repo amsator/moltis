@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Local PR Validation - Moltis Documentation</title>
+        <title>Local Validation - Moltis Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -183,20 +183,24 @@
 
                 <div id="content" class="content">
                     <main>
-                        <h1 id="local-pr-validation"><a class="header" href="#local-pr-validation">Local PR Validation</a></h1>
-<p>Moltis uses a local-first pull request flow: contributors run validation checks
-on their own machine and publish the results to GitHub commit statuses.</p>
+                        <h1 id="local-validation"><a class="header" href="#local-validation">Local Validation</a></h1>
+<p>Moltis provides a local validation script that runs the same checks as CI
+(format, lint, test) on your machine.</p>
 <h2 id="why-this-exists"><a class="header" href="#why-this-exists">Why this exists</a></h2>
 <ul>
-<li>Faster feedback for Rust-heavy branches (no long runner queues for every PR push)</li>
+<li>Faster feedback for Rust-heavy branches (no long runner queues for every push)</li>
 <li>Better parity with a developer’s local environment while iterating</li>
 <li>Clear visibility in the PR UI (<code>fmt</code>, <code>biome</code>, <code>zizmor</code>, <code>clippy</code>, <code>test</code>)</li>
 </ul>
-<h2 id="run-local-validation-for-a-pr"><a class="header" href="#run-local-validation-for-a-pr">Run local validation for a PR</a></h2>
-<p>Use the PR number:</p>
-<pre><code class="language-bash">./scripts/local-validate-pr.sh 63
+<h2 id="run-local-validation"><a class="header" href="#run-local-validation">Run local validation</a></h2>
+<p>Run all checks on your current checkout:</p>
+<pre><code class="language-bash">./scripts/local-validate.sh
 </code></pre>
-<p>The script publishes status checks for the current PR head commit:</p>
+<p>When working on a pull request, pass the PR number to also publish commit
+statuses to GitHub:</p>
+<pre><code class="language-bash">./scripts/local-validate.sh 63
+</code></pre>
+<p>The script runs these checks:</p>
 <ul>
 <li><code>local/fmt</code></li>
 <li><code>local/biome</code></li>
@@ -204,7 +208,8 @@ on their own machine and publish the results to GitHub commit statuses.</p>
 <li><code>local/lint</code></li>
 <li><code>local/test</code></li>
 </ul>
-<p>The PR workflow verifies these contexts and surfaces them as checks in the PR.</p>
+<p>In PR mode, the PR workflow verifies these contexts and surfaces them as
+checks in the PR.</p>
 <h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
 <ul>
 <li>On macOS without CUDA (<code>nvcc</code>), the script automatically falls back to

@@ -18,7 +18,7 @@ use moltis_channels::{
     message_log::MessageLog,
     plugin::{
         ChannelEvent, ChannelHealthSnapshot, ChannelMessageMeta, ChannelOutbound, ChannelPlugin,
-        ChannelReplyTarget, ChannelStatus,
+        ChannelReplyTarget, ChannelStatus, ChannelType,
     },
 };
 
@@ -443,7 +443,7 @@ fn handle_sidecar_message(
             // Emit event for UI.
             if let Some(sink) = sink.clone() {
                 let event = ChannelEvent::InboundMessage {
-                    channel_type: "whatsapp-web".to_string(),
+                    channel_type: ChannelType::WhatsappWeb,
                     account_id: account_id.clone(),
                     peer_id: sender_jid.clone(),
                     username: sender_name.clone(),
@@ -459,12 +459,12 @@ fn handle_sidecar_message(
             // Dispatch to chat if access granted.
             if access_granted && let Some(sink) = sink {
                 let reply_target = ChannelReplyTarget {
-                    channel_type: "whatsapp-web".to_string(),
+                    channel_type: ChannelType::WhatsappWeb,
                     account_id: account_id.clone(),
                     chat_id: chat_jid,
                 };
                 let meta = ChannelMessageMeta {
-                    channel_type: "whatsapp-web".to_string(),
+                    channel_type: ChannelType::WhatsappWeb,
                     sender_name,
                     username: None,
                     model: config.as_ref().and_then(|c| c.model.clone()),

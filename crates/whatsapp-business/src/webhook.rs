@@ -10,7 +10,7 @@ use {
 
 use {
     moltis_channels::{
-        ChannelEvent, ChannelMessageMeta, ChannelOutbound, ChannelReplyTarget,
+        ChannelEvent, ChannelMessageMeta, ChannelOutbound, ChannelReplyTarget, ChannelType,
         message_log::MessageLogEntry,
     },
     moltis_common::types::ChatType,
@@ -157,7 +157,7 @@ pub async fn process_webhook(
                     let entry = MessageLogEntry {
                         id: 0,
                         account_id: account_id.to_string(),
-                        channel_type: "whatsapp".into(),
+                        channel_type: ChannelType::Whatsapp.to_string(),
                         peer_id: peer_id.clone(),
                         username: None, // WhatsApp doesn't have usernames
                         sender_name: sender_name.clone(),
@@ -175,7 +175,7 @@ pub async fn process_webhook(
                 // Emit channel event for real-time UI updates.
                 if let Some(ref sink) = event_sink {
                     sink.emit(ChannelEvent::InboundMessage {
-                        channel_type: "whatsapp".into(),
+                        channel_type: ChannelType::Whatsapp,
                         account_id: account_id.to_string(),
                         peer_id: peer_id.clone(),
                         username: None,
@@ -198,7 +198,7 @@ pub async fn process_webhook(
                     && !text.is_empty()
                 {
                     let reply_target = ChannelReplyTarget {
-                        channel_type: "whatsapp".into(),
+                        channel_type: ChannelType::Whatsapp,
                         account_id: account_id.to_string(),
                         chat_id: peer_id.clone(),
                     };
@@ -237,7 +237,7 @@ pub async fn process_webhook(
                     }
 
                     let meta = ChannelMessageMeta {
-                        channel_type: "whatsapp".into(),
+                        channel_type: ChannelType::Whatsapp,
                         sender_name,
                         username: None,
                         model: config.model.clone(),

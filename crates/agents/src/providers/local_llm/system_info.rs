@@ -35,7 +35,7 @@ impl SystemInfo {
         let has_metal = cfg!(target_os = "macos") && cfg!(feature = "local-llm-metal");
 
         // CUDA detection: compile-time feature check
-        let has_cuda = cfg!(feature = "local-llm-cuda");
+        let has_cuda = cfg!(not(target_os = "macos")) && cfg!(feature = "local-llm-cuda");
 
         Self {
             total_ram_bytes,

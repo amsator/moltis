@@ -12,7 +12,14 @@ format-check:
 
 # Lint Rust code using clippy
 lint:
-    cargo clippy --bins --tests --benches --examples --all-features --all-targets -- -D warnings
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)" = "Darwin" ]; then
+        cargo clippy --workspace --all-targets --all-features --exclude moltis-agents --exclude moltis-gateway -- -D warnings
+        cargo clippy -p moltis-gateway --all-targets --features local-llm-metal -- -D warnings
+    else
+        cargo clippy --bins --tests --benches --examples --all-features --all-targets -- -D warnings
+    fi
 
 # Build the project
 build:
@@ -179,7 +186,14 @@ ci: format-check lint build test
 
 # Run all tests
 test:
-    cargo test --all-features
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)" = "Darwin" ]; then
+        cargo test --workspace --all-features --exclude moltis-agents --exclude moltis-gateway
+        cargo test -p moltis-gateway --features local-llm-metal
+    else
+        cargo test --all-features
+    fi
 
 # Build all Linux packages (deb + rpm + arch + appimage) for all architectures
 packages-all: deb-all rpm-all arch-pkg-all

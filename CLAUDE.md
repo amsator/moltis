@@ -641,8 +641,8 @@ integrate them together so nothing is lost.
 
 **You MUST run all checks before every commit and fix any issues they report:**
 1. `cargo +nightly fmt --all` — format all Rust code (CI runs `cargo fmt --all -- --check`)
-2. `cargo +nightly clippy --all-targets --all-features -- -D warnings` — run linter (must pass with zero warnings)
-3. `cargo test --all-features` — run all tests
+2. `just lint` — run linter (OS-aware local-LLM backend checks; must pass with zero warnings)
+3. `just test` — run tests (OS-aware local-LLM backend checks)
 4. `biome check --write` (when JS files were modified; CI runs `biome ci`)
 5. `taplo fmt` (when TOML files were modified)
 

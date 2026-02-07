@@ -364,8 +364,11 @@ cargo run -- --config-dir /path/to/config --data-dir /path/to/data
 ### Test
 
 ```bash
-cargo test --all-features
+just test
 ```
+
+`just test` is OS-aware: on macOS it validates the Metal local-LLM path, and on
+Linux it runs full `--all-features` coverage.
 
 ## Hooks
 

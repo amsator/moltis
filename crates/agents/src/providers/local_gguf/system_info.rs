@@ -31,7 +31,7 @@ impl SystemInfo {
         let has_metal = cfg!(target_os = "macos") && cfg!(feature = "local-llm-metal");
 
         // CUDA detection: compile-time feature check
-        let has_cuda = cfg!(feature = "local-llm-cuda");
+        let has_cuda = cfg!(not(target_os = "macos")) && cfg!(feature = "local-llm-cuda");
 
         // Apple Silicon detection: macOS + ARM architecture
         let is_apple_silicon = cfg!(target_os = "macos") && cfg!(target_arch = "aarch64");

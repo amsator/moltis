@@ -285,7 +285,12 @@ enabled = true              # run in sandbox (default)
 # image = "custom:latest"   # optional custom image
 </code></pre>
 <h2 id="identity-protection"><a class="header" href="#identity-protection">Identity Protection</a></h2>
-<p>The agent’s identity (name, personality “soul”) is stored in <code>moltis.toml</code>.
+<p>The agent’s identity fields (name, emoji, creature, vibe) are stored in <code>IDENTITY.md</code>
+YAML frontmatter at the workspace root (<code>data_dir</code>).
+User profile fields are stored in <code>USER.md</code> YAML frontmatter at the same location.
+The personality text is stored separately in <code>SOUL.md</code> at the workspace root (<code>data_dir</code>).
+Tool guidance is stored in <code>TOOLS.md</code> at the workspace root (<code>data_dir</code>) and is injected
+as workspace context in the system prompt.
 Modifying identity requires the <code>operator.write</code> scope, not just <code>operator.read</code>.</p>
 <p>This prevents prompt injection attacks from subtly modifying the agent’s
 personality to make it more compliant with malicious requests.</p>

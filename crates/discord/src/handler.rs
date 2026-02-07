@@ -13,7 +13,7 @@ use {
 };
 
 use moltis_channels::{
-    ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget,
+    ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget, ChannelType,
     gating::{DmPolicy, GroupPolicy, MentionMode, is_allowed},
     message_log::{MessageLog, MessageLogEntry},
     plugin::ChannelEvent,
@@ -155,7 +155,7 @@ impl EventHandler for DiscordHandler {
             let entry = MessageLogEntry {
                 id: 0,
                 account_id: self.account_id.clone(),
-                channel_type: "discord".into(),
+                channel_type: ChannelType::Discord.to_string(),
                 peer_id: user_id.clone(),
                 username: Some(msg.author.name.clone()),
                 sender_name: msg.author.global_name.clone(),
@@ -176,7 +176,7 @@ impl EventHandler for DiscordHandler {
         // Emit channel event
         if let Some(sink) = &self.event_sink {
             sink.emit(ChannelEvent::InboundMessage {
-                channel_type: "discord".into(),
+                channel_type: ChannelType::Discord,
                 account_id: self.account_id.clone(),
                 peer_id: user_id.clone(),
                 username: Some(msg.author.name.clone()),
@@ -223,7 +223,7 @@ impl EventHandler for DiscordHandler {
             ) {
                 if let Some(sink) = &self.event_sink {
                     let reply_to = ChannelReplyTarget {
-                        channel_type: "discord".into(),
+                        channel_type: ChannelType::Discord,
                         account_id: self.account_id.clone(),
                         chat_id: channel_id.clone(),
                     };
@@ -255,13 +255,13 @@ impl EventHandler for DiscordHandler {
 
         // Build reply target
         let reply_to = ChannelReplyTarget {
-            channel_type: "discord".into(),
+            channel_type: ChannelType::Discord,
             account_id: self.account_id.clone(),
             chat_id: channel_id,
         };
 
         let meta = ChannelMessageMeta {
-            channel_type: "discord".into(),
+            channel_type: ChannelType::Discord,
             sender_name: msg.author.global_name.clone(),
             username: Some(msg.author.name.clone()),
             model: self.config.model.clone(),

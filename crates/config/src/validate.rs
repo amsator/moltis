@@ -285,7 +285,11 @@ fn build_schema_map() -> KnownKeys {
         ),
         (
             "channels",
-            Struct(HashMap::from([("telegram", Map(Box::new(Leaf)))])),
+            Struct(HashMap::from([
+                ("telegram", Map(Box::new(Leaf))),
+                ("slack", Map(Box::new(Leaf))),
+                ("discord", Map(Box::new(Leaf))),
+            ])),
         ),
         (
             "tls",

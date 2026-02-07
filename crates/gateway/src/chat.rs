@@ -2267,7 +2267,9 @@ async fn deliver_channel_replies_to_targets(
         let text = text.clone();
         tasks.push(tokio::spawn(async move {
             match target.channel_type {
-                moltis_channels::ChannelType::Telegram => {
+                moltis_channels::ChannelType::Telegram
+                | moltis_channels::ChannelType::Slack
+                | moltis_channels::ChannelType::Discord => {
                     if let Err(e) = outbound
                         .send_text(&target.account_id, &target.chat_id, &text)
                         .await
@@ -2476,7 +2478,9 @@ async fn send_screenshot_to_channels(
         let payload = payload.clone();
         tasks.push(tokio::spawn(async move {
             match target.channel_type {
-                moltis_channels::ChannelType::Telegram => {
+                moltis_channels::ChannelType::Telegram
+                | moltis_channels::ChannelType::Slack
+                | moltis_channels::ChannelType::Discord => {
                     if let Err(e) = outbound
                         .send_media(&target.account_id, &target.chat_id, &payload)
                         .await
@@ -2495,7 +2499,7 @@ async fn send_screenshot_to_channels(
                         debug!(
                             account_id = target.account_id,
                             chat_id = target.chat_id,
-                            "sent screenshot to telegram"
+                            "sent screenshot to channel"
                         );
                     }
                 },

@@ -2056,7 +2056,7 @@ dependencies = [
  "gix-worktree-stream",
  "parking_lot",
  "regex",
- "signal-hook",
+ "signal-hook 0.4.3",
  "smallvec",
  "thiserror 2.0.18",
 ]
@@ -2759,7 +2759,7 @@ dependencies = [
  "gix-fs",
  "libc",
  "parking_lot",
- "signal-hook",
+ "signal-hook 0.4.3",
  "signal-hook-registry",
  "tempfile",
 ]
@@ -6411,11 +6411,21 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "cc",
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b57709da74f9ff9f4a27dce9526eec25ca8407c45a7887243b031a58935fb8e"
 dependencies = [
- "cc",
  "libc",
  "signal-hook-registry",
 ]
@@ -6438,7 +6448,7 @@ checksum = "213241f76fb1e37e27de3b6aa1b068a2c333233b59cca6634f634b80a27ecf1e"
 dependencies = [
  "futures-core",
  "libc",
- "signal-hook",
+ "signal-hook 0.3.18",
  "tokio",
 ]
 
@@ -6525,7 +6535,7 @@ dependencies = [
  "serde_json",
  "serde_with 3.16.1",
  "sha2",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-tokio",
  "subtle",
  "tokio",

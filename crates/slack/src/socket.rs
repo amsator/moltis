@@ -13,7 +13,7 @@ use {
 };
 
 use moltis_channels::{
-    ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget,
+    ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget, ChannelType,
     gating::{DmPolicy, GroupPolicy, MentionMode, is_allowed},
     message_log::{MessageLog, MessageLogEntry},
     plugin::ChannelEvent,
@@ -213,7 +213,7 @@ async fn handle_command_events(
         let command = event.command.to_string();
         let command = command.trim_start_matches('/');
         let reply_to = ChannelReplyTarget {
-            channel_type: "slack".into(),
+            channel_type: ChannelType::Slack,
             account_id: state.account_id.clone(),
             chat_id: event.channel_id.to_string(),
         };
@@ -304,7 +304,7 @@ async fn handle_message_event(state: &SocketModeState, event: &SlackMessageEvent
         let entry = MessageLogEntry {
             id: 0,
             account_id: state.account_id.clone(),
-            channel_type: "slack".into(),
+            channel_type: ChannelType::Slack.to_string(),
             peer_id: user_id.clone().unwrap_or_else(|| "unknown".into()),
             username: None,
             sender_name: None,
@@ -325,7 +325,7 @@ async fn handle_message_event(state: &SocketModeState, event: &SlackMessageEvent
     // Emit channel event
     if let Some(sink) = &state.event_sink {
         sink.emit(ChannelEvent::InboundMessage {
-            channel_type: "slack".into(),
+            channel_type: ChannelType::Slack,
             account_id: state.account_id.clone(),
             peer_id: user_id.clone().unwrap_or_default(),
             username: None,
@@ -372,13 +372,13 @@ async fn handle_message_event(state: &SocketModeState, event: &SlackMessageEvent
 
     // Build reply target
     let reply_to = ChannelReplyTarget {
-        channel_type: "slack".into(),
+        channel_type: ChannelType::Slack,
         account_id: state.account_id.clone(),
         chat_id: channel_id,
     };
 
     let meta = ChannelMessageMeta {
-        channel_type: "slack".into(),
+        channel_type: ChannelType::Slack,
         sender_name: None,
         username: user_id,
         model: state.config.model.clone(),

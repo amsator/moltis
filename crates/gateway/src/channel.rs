@@ -495,6 +495,12 @@ impl ChannelService for LiveChannelService {
             _ => Vec::new(),
         };
 
+        // Query pending OTP challenges for this account.
+        let otp_challenges = {
+            let tg_inner = self.telegram.read().await;
+            tg_inner.pending_otp_challenges(account_id)
+        };
+
         let list: Vec<Value> = senders
             .into_iter()
             .map(|s| {
@@ -505,14 +511,22 @@ impl ChannelService for LiveChannelService {
                             .as_ref()
                             .is_some_and(|u| a_lower == u.to_lowercase())
                 });
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "peer_id": s.peer_id,
                     "username": s.username,
                     "sender_name": s.sender_name,
                     "message_count": s.message_count,
                     "last_seen": s.last_seen,
                     "allowed": is_allowed,
-                })
+                });
+                // Attach OTP info if a challenge is pending for this peer.
+                if let Some(otp) = otp_challenges.iter().find(|c| c.peer_id == s.peer_id) {
+                    entry["otp_pending"] = serde_json::json!({
+                        "code": otp.code,
+                        "expires_at": otp.expires_at,
+                    });
+                }
+                entry
             })
             .collect();
 
@@ -592,36 +606,32 @@ impl ChannelService for LiveChannelService {
             warn!(error = %e, account_id, "failed to persist sender approval");
         }
 
-        // Restart account with new config.
+// Hot-update the in-memory config where supported, restart otherwise.
         match channel_type {
             "telegram" => {
-                let mut tg = self.telegram.write().await;
-                if let Err(e) = tg.stop_account(account_id).await {
-                    warn!(error = %e, account_id, "failed to stop account for sender approval");
+                // Telegram supports hot-update (preserves polling offset).
+                let tg = self.telegram.read().await;
+                if let Err(e) = tg.update_account_config(account_id, config) {
+                    warn!(error = %e, account_id, "failed to hot-update config for sender approval");
                 }
-                tg.start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
             },
             "slack" => {
                 let mut slack = self.slack.write().await;
                 if let Err(e) = slack.stop_account(account_id).await {
                     warn!(error = %e, account_id, "failed to stop account for sender approval");
                 }
-                slack
-                    .start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if let Err(e) = slack.start_account(account_id, config).await {
+                    warn!(error = %e, account_id, "failed to restart account for sender approval");
+                }
             },
             "discord" => {
                 let mut discord = self.discord.write().await;
                 if let Err(e) = discord.stop_account(account_id).await {
                     warn!(error = %e, account_id, "failed to stop account for sender approval");
                 }
-                discord
-                    .start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if let Err(e) = discord.start_account(account_id, config).await {
+                    warn!(error = %e, account_id, "failed to restart account for sender approval");
+                }
             },
             _ => return Err(format!("unsupported channel type: {channel_type}")),
         }
@@ -687,36 +697,32 @@ impl ChannelService for LiveChannelService {
             warn!(error = %e, account_id, "failed to persist sender denial");
         }
 
-        // Restart account with new config.
+// Hot-update the in-memory config where supported, restart otherwise.
         match channel_type {
             "telegram" => {
-                let mut tg = self.telegram.write().await;
-                if let Err(e) = tg.stop_account(account_id).await {
-                    warn!(error = %e, account_id, "failed to stop account for sender denial");
+                // Telegram supports hot-update.
+                let tg = self.telegram.read().await;
+                if let Err(e) = tg.update_account_config(account_id, config) {
+                    warn!(error = %e, account_id, "failed to hot-update config for sender denial");
                 }
-                tg.start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
             },
             "slack" => {
                 let mut slack = self.slack.write().await;
                 if let Err(e) = slack.stop_account(account_id).await {
                     warn!(error = %e, account_id, "failed to stop account for sender denial");
                 }
-                slack
-                    .start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if let Err(e) = slack.start_account(account_id, config).await {
+                    warn!(error = %e, account_id, "failed to restart account for sender denial");
+                }
             },
             "discord" => {
                 let mut discord = self.discord.write().await;
                 if let Err(e) = discord.stop_account(account_id).await {
                     warn!(error = %e, account_id, "failed to stop account for sender denial");
                 }
-                discord
-                    .start_account(account_id, config)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                if let Err(e) = discord.start_account(account_id, config).await {
+                    warn!(error = %e, account_id, "failed to restart account for sender denial");
+                }
             },
             _ => return Err(format!("unsupported channel type: {channel_type}")),
         }

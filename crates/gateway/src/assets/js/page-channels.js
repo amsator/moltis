@@ -10,7 +10,7 @@ import { updateNavCount } from "./nav-counts.js";
 import { navigate, registerPrefix } from "./router.js";
 import { connected, models as modelsSig } from "./signals.js";
 import * as S from "./state.js";
-import { ConfirmDialog, Modal, ModelSelect, requestConfirm } from "./ui.js";
+import { ConfirmDialog, Modal, ModelSelect, requestConfirm, showToast } from "./ui.js";
 
 var channels = signal([]);
 var containerRef = null;
@@ -208,7 +208,10 @@ function SendersTab() {
 		sendRpc(rpc, {
 			account_id: sendersAccount.value,
 			identifier: identifier,
-		}).then(() => loadSenders());
+		}).then(() => {
+			loadSenders();
+			loadChannels();
+		});
 	}
 
 	return html`<div>
@@ -242,7 +245,13 @@ function SendersTab() {
             <td class="senders-td">${s.message_count}</td>
             <td class="senders-td" style="color:var(--muted);font-size:12px;">${lastSeenMs ? html`<time data-epoch-ms="${lastSeenMs}">${new Date(lastSeenMs).toISOString()}</time>` : "\u2014"}</td>
             <td class="senders-td">
-              <span class="provider-item-badge ${s.allowed ? "configured" : "oauth"}">${s.allowed ? "Allowed" : "Denied"}</span>
+              ${
+								s.otp_pending
+									? html`<span class="provider-item-badge cursor-pointer select-none" style="background:var(--warning-bg, #fef3c7);color:var(--warning-text, #92400e);" onClick=${() => {
+											navigator.clipboard.writeText(s.otp_pending.code).then(() => showToast("OTP code copied"));
+										}}>OTP: <code class="text-xs">${s.otp_pending.code}</code></span>`
+									: html`<span class="provider-item-badge ${s.allowed ? "configured" : "oauth"}">${s.allowed ? "Allowed" : "Denied"}</span>`
+							}
             </td>
             <td class="senders-td">
               ${

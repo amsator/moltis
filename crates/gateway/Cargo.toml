@@ -1,7 +1,8 @@
 [package]
-edition.workspace = true
-name              = "moltis-gateway"
-version.workspace = true
+edition.workspace    = true
+name                 = "moltis-gateway"
+repository.workspace = true
+version.workspace    = true
 
 [dependencies]
 anyhow                   = { workspace = true }
@@ -39,6 +40,7 @@ moltis-sessions          = { workspace = true }
 moltis-skills            = { workspace = true }
 moltis-telegram          = { workspace = true }
 moltis-tools             = { workspace = true }
+moltis-voice             = { optional = true, workspace = true }
 moltis-whatsapp          = { optional = true, workspace = true }
 moltis-whatsapp-business = { optional = true, workspace = true }
 p256                     = { features = ["ecdsa"], optional = true, workspace = true }
@@ -82,6 +84,7 @@ default = [
   "push-notifications",
   "tailscale",
   "tls",
+  "voice",
   "web-ui",
   "whatsapp-business",
   "whatsapp-web",
@@ -104,6 +107,7 @@ tls = [
   "dep:time",
   "dep:tokio-rustls",
 ]
+voice = ["dep:moltis-voice"]
 web-ui = ["dep:include_dir"]
 whatsapp-business = ["dep:moltis-whatsapp-business"]
 whatsapp-web = ["dep:moltis-whatsapp"]

@@ -55,6 +55,8 @@ pub mod tailscale_routes;
 pub mod tls;
 pub mod tools_routes;
 pub mod update_check;
+pub mod voice;
+pub mod voice_agent_tools;
 #[cfg(feature = "whatsapp-business")]
 pub mod whatsapp_routes;
 pub mod ws;

@@ -82,6 +82,14 @@ use crate::{
     services::GatewayServices,
 };
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsRuntimeOverride {
+    pub provider: Option<String>,
+    pub voice_id: Option<String>,
+    pub model: Option<String>,
+}
+
 // ── Connected client ─────────────────────────────────────────────────────────
 
 /// A WebSocket client currently connected to the gateway.
@@ -267,6 +275,10 @@ pub struct GatewayState {
     /// send, we queue the reply target so the "final" response can be routed
     /// back to the originating channel.
     pub channel_reply_queue: RwLock<HashMap<String, Vec<ChannelReplyTarget>>>,
+    /// Per-session TTS runtime overrides (session_key -> override).
+    pub tts_session_overrides: RwLock<HashMap<String, TtsRuntimeOverride>>,
+    /// Per-channel-account TTS runtime overrides ((channel, account) -> override).
+    pub tts_channel_overrides: RwLock<HashMap<String, TtsRuntimeOverride>>,
     /// Hook registry for dispatching lifecycle events.
     pub hook_registry: RwLock<Option<Arc<moltis_common::hooks::HookRegistry>>>,
     /// Discovered hook metadata for the web UI.
@@ -287,6 +299,8 @@ pub struct GatewayState {
     pub deploy_platform: Option<String>,
     /// The port the gateway is bound to.
     pub port: u16,
+    /// Auto-update availability state from GitHub releases.
+    pub update: RwLock<crate::update_check::UpdateAvailability>,
     /// Last error per run_id (short-lived, for send_sync to retrieve).
     pub run_errors: RwLock<HashMap<String, String>>,
     /// Metrics handle for Prometheus export (None if metrics disabled).
@@ -400,6 +414,8 @@ impl GatewayState {
             sandbox_router,
             domain_approval,
             channel_reply_queue: RwLock::new(HashMap::new()),
+            tts_session_overrides: RwLock::new(HashMap::new()),
+            tts_channel_overrides: RwLock::new(HashMap::new()),
             hook_registry: RwLock::new(hook_registry),
             discovered_hooks: RwLock::new(Vec::new()),
             disabled_hooks: RwLock::new(HashSet::new()),
@@ -409,6 +425,7 @@ impl GatewayState {
             tls_active,
             deploy_platform,
             port,
+            update: RwLock::new(crate::update_check::UpdateAvailability::default()),
             heartbeat_config: RwLock::new(moltis_config::schema::HeartbeatConfig::default()),
             run_errors: RwLock::new(HashMap::new()),
             #[cfg(feature = "metrics")]
@@ -480,6 +497,12 @@ impl GatewayState {
     pub async fn drain_channel_replies(&self, session_key: &str) -> Vec<ChannelReplyTarget> {
         let mut queue = self.channel_reply_queue.write().await;
         queue.remove(session_key).unwrap_or_default()
+    }
+
+    /// Get a copy of pending reply targets without removing them.
+    pub async fn peek_channel_replies(&self, session_key: &str) -> Vec<ChannelReplyTarget> {
+        let queue = self.channel_reply_queue.read().await;
+        queue.get(session_key).cloned().unwrap_or_default()
     }
 
     /// Record a run error (for send_sync to retrieve).

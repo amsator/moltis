@@ -10,6 +10,7 @@ import { renderProjectSelect } from "./projects.js";
 import { initPWA } from "./pwa.js";
 import { initInstallBanner } from "./pwa-install.js";
 import { mount, navigate, registerPage } from "./router.js";
+import { updateSandboxImageUI, updateSandboxUI } from "./sandbox.js";
 import { fetchSessions, refreshActiveSession, renderSessionList } from "./sessions.js";
 import * as S from "./state.js";
 import { initTheme, injectMarkdownStyles } from "./theme.js";
@@ -22,7 +23,6 @@ import "./page-projects.js";
 import "./page-providers.js";
 import "./page-channels.js";
 import "./page-logs.js";
-import "./page-plugins.js";
 import "./page-skills.js";
 import "./page-mcp.js";
 import "./page-hooks.js";
@@ -50,6 +50,8 @@ initMobile();
 // State for favicon/title restoration when switching branches.
 var originalFavicons = [];
 var originalTitle = document.title;
+var UPDATE_DISMISS_KEY = "moltis-update-dismissed-version";
+var currentUpdateVersion = null;
 
 // Apply server-injected identity immediately (no async wait), and
 // keep the header in sync whenever gon.identity is refreshed.
@@ -67,6 +69,14 @@ try {
 	// Non-fatal — branch indicator is cosmetic.
 }
 gon.onChange("git_branch", showBranchBanner);
+try {
+	showUpdateBanner(gon.get("update"));
+} catch (_) {
+	// Non-fatal — update indicator is cosmetic.
+}
+gon.onChange("update", showUpdateBanner);
+onEvent("update.available", showUpdateBanner);
+initUpdateBannerDismiss();
 onEvent("session", (payload) => {
 	fetchSessions();
 	if (payload && payload.kind === "patched" && payload.sessionKey === S.activeSessionKey) {
@@ -119,6 +129,42 @@ fetch("/api/auth/status")
 function showAuthDisabledBanner() {
 	var el = document.getElementById("authDisabledBanner");
 	if (el) el.style.display = "";
+}
+
+function showUpdateBanner(update) {
+	var el = document.getElementById("updateBanner");
+	if (!el) return;
+
+	var latestVersion = update?.latest_version || null;
+	currentUpdateVersion = latestVersion;
+	var dismissedVersion = localStorage.getItem(UPDATE_DISMISS_KEY);
+
+	if (update?.available && (!latestVersion || dismissedVersion !== latestVersion)) {
+		var versionEl = document.getElementById("updateLatestVersion");
+		if (versionEl) {
+			versionEl.textContent = latestVersion ? `v${latestVersion}` : "";
+		}
+		var linkEl = document.getElementById("updateReleaseLink");
+		if (linkEl && update.release_url) {
+			linkEl.href = update.release_url;
+		}
+		el.style.display = "";
+	} else {
+		el.style.display = "none";
+	}
+}
+
+function initUpdateBannerDismiss() {
+	var dismissBtn = document.getElementById("updateDismissBtn");
+	if (!dismissBtn || dismissBtn.dataset.bound === "1") return;
+	dismissBtn.dataset.bound = "1";
+	dismissBtn.addEventListener("click", () => {
+		if (currentUpdateVersion) {
+			localStorage.setItem(UPDATE_DISMISS_KEY, currentUpdateVersion);
+		}
+		var el = document.getElementById("updateBanner");
+		if (el) el.style.display = "none";
+	});
 }
 
 function showBranchBanner(branch) {
@@ -213,6 +259,10 @@ function fetchBootstrap() {
 				renderSessionProjectSelect();
 			}
 			S.setSandboxInfo(boot.sandbox || null);
+			// Re-apply sandbox UI now that we know the backend status.
+			// This fixes the race where the chat page renders before bootstrap completes.
+			updateSandboxUI(S.sessionSandboxEnabled);
+			updateSandboxImageUI(S.sessionSandboxImage);
 			if (boot.counts) updateNavCounts(boot.counts);
 		})
 		.catch(() => {

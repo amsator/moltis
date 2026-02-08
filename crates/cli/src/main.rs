@@ -1,4 +1,5 @@
 mod auth_commands;
+mod browser_commands;
 mod config_commands;
 mod db_commands;
 mod hooks_commands;
@@ -7,6 +8,7 @@ mod sandbox_commands;
 mod tailscale_commands;
 
 use {
+    anyhow::anyhow,
     clap::{Parser, Subcommand},
     moltis_gateway::logs::{LogBroadcastLayer, LogBuffer},
     tracing::info,
@@ -113,6 +115,11 @@ enum Commands {
         #[command(subcommand)]
         action: sandbox_commands::SandboxAction,
     },
+    /// Browser configuration management.
+    Browser {
+        #[command(subcommand)]
+        action: browser_commands::BrowserAction,
+    },
     /// Database management (reset, clear, migrate).
     Db {
         #[command(subcommand)]
@@ -167,8 +174,15 @@ enum SkillAction {
 /// Initialise tracing and optionally attach a [`LogBroadcastLayer`] that
 /// captures events into an in-memory ring buffer for the web UI.
 fn init_telemetry(cli: &Cli, log_buffer: Option<LogBuffer>) {
-    let filter =
+    // Start with user-specified or default log level
+    let base_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+
+    // Suppress noisy chromiumoxide logs:
+    // - "WS Invalid message" warnings (Chrome sends CDP events the library doesn't recognize)
+    // - "WS Connection error" errors (normal when idle connections are closed)
+    // These are expected browser sandbox behavior, not actionable errors.
+    let filter = base_filter.add_directive("chromiumoxide=off".parse().unwrap());
 
     let registry = tracing_subscriber::registry().with(filter);
 
@@ -184,7 +198,7 @@ fn init_telemetry(cli: &Cli, log_buffer: Option<LogBuffer>) {
         registry
             .with(
                 fmt::layer()
-                    .with_target(false)
+                    .with_target(true)
                     .with_thread_ids(false)
                     .with_ansi(true),
             )
@@ -293,6 +307,25 @@ async fn main() -> anyhow::Result<()> {
         moltis_config::set_data_dir(dir.clone());
     }
 
+    // Ensure config/data directories exist for every command path. This is a
+    // hard requirement for startup; fail fast if directory initialization fails.
+    let config_dir =
+        moltis_config::config_dir().ok_or_else(|| anyhow!("unable to resolve config directory"))?;
+    std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed to create config directory {}: {e}",
+            config_dir.display()
+        )
+    });
+
+    let data_dir = moltis_config::data_dir();
+    std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed to create data directory {}: {e}",
+            data_dir.display()
+        )
+    });
+
     match cli.command {
         // Default: start gateway when no subcommand is provided
         None | Some(Commands::Gateway) => {
@@ -338,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Onboard) => moltis_onboarding::wizard::run_onboarding().await,
         Some(Commands::Auth { action }) => auth_commands::handle_auth(action).await,
         Some(Commands::Sandbox { action }) => sandbox_commands::handle_sandbox(action).await,
+        Some(Commands::Browser { action }) => browser_commands::handle_browser(action),
         Some(Commands::Db { action }) => db_commands::handle_db(action).await,
         #[cfg(feature = "tailscale")]
         Some(Commands::Tailscale { action }) => tailscale_commands::handle_tailscale(action).await,
@@ -360,8 +394,7 @@ async fn handle_skills(action: SkillAction) -> anyhow::Result<()> {
         registry::{InMemoryRegistry, SkillRegistry},
     };
 
-    let cwd = std::env::current_dir()?;
-    let search_paths = FsSkillDiscoverer::default_paths(&cwd);
+    let search_paths = FsSkillDiscoverer::default_paths();
     let discoverer = FsSkillDiscoverer::new(search_paths);
 
     match action {

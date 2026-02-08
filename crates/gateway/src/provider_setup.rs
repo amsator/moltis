@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use secrecy::{ExposeSecret, Secret};
 
@@ -32,6 +36,11 @@ pub(crate) struct ProviderConfig {
 /// Stores per-provider configuration including API keys, base URLs, and models.
 #[derive(Debug, Clone)]
 pub(crate) struct KeyStore {
+    inner: Arc<Mutex<KeyStoreInner>>,
+}
+
+#[derive(Debug)]
+struct KeyStoreInner {
     path: PathBuf,
 }
 
@@ -44,17 +53,25 @@ impl KeyStore {
             .join(".config")
             .join("moltis")
             .join("provider_keys.json");
-        Self { path }
+        Self {
+            inner: Arc::new(Mutex::new(KeyStoreInner { path })),
+        }
     }
 
     #[cfg(test)]
     fn with_path(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            inner: Arc::new(Mutex::new(KeyStoreInner { path })),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, KeyStoreInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Load all provider configs. Handles migration from old format (string values).
-    fn load_all_configs(&self) -> HashMap<String, ProviderConfig> {
-        let content = match std::fs::read_to_string(&self.path) {
+    fn load_all_configs_from_path(path: &PathBuf) -> HashMap<String, ProviderConfig> {
+        let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return HashMap::new(),
         };
@@ -81,18 +98,37 @@ impl KeyStore {
         HashMap::new()
     }
 
+    fn load_all_configs(&self) -> HashMap<String, ProviderConfig> {
+        let guard = self.lock();
+        Self::load_all_configs_from_path(&guard.path)
+    }
+
     /// Save all provider configs to disk.
-    fn save_all_configs(&self, configs: &HashMap<String, ProviderConfig>) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
+    fn save_all_configs_to_path(
+        path: &PathBuf,
+        configs: &HashMap<String, ProviderConfig>,
+    ) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let data = serde_json::to_string_pretty(configs).map_err(|e| e.to_string())?;
-        std::fs::write(&self.path, &data).map_err(|e| e.to_string())?;
+
+        // Write atomically via temp file + rename so readers never observe
+        // partially-written JSON.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = path.with_extension(format!("json.tmp.{nanos}"));
+        std::fs::write(&temp_path, &data).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600));
         }
+
+        std::fs::rename(&temp_path, path).map_err(|e| e.to_string())?;
+
         Ok(())
     }
 
@@ -119,9 +155,10 @@ impl KeyStore {
 
     /// Remove a provider's configuration.
     fn remove(&self, provider: &str) -> Result<(), String> {
-        let mut configs = self.load_all_configs();
+        let guard = self.lock();
+        let mut configs = Self::load_all_configs_from_path(&guard.path);
         configs.remove(provider);
-        self.save_all_configs(&configs)
+        Self::save_all_configs_to_path(&guard.path, &configs)
     }
 
     /// Save a provider's API key (simple interface, used in tests).
@@ -143,7 +180,8 @@ impl KeyStore {
         base_url: Option<String>,
         model: Option<String>,
     ) -> Result<(), String> {
-        let mut configs = self.load_all_configs();
+        let guard = self.lock();
+        let mut configs = Self::load_all_configs_from_path(&guard.path);
         let entry = configs.entry(provider.to_string()).or_default();
 
         // Only update fields that are provided (Some), preserve existing for None
@@ -165,7 +203,7 @@ impl KeyStore {
             };
         }
 
-        self.save_all_configs(&configs)
+        Self::save_all_configs_to_path(&guard.path, &configs)
     }
 }
 
@@ -210,13 +248,19 @@ pub(crate) fn config_with_saved_keys(
     #[cfg(feature = "local-llm")]
     {
         if let Some(local_config) = crate::local_llm_setup::LocalLlmConfig::load() {
-            // Only merge if there's no model already configured in moltis.toml
+            // Collect all configured model IDs for multi-model support
+            config.local_models = local_config
+                .models
+                .iter()
+                .map(|m| m.model_id.clone())
+                .collect();
+
+            // Also set the first model as the default for backward compatibility
             let entry = config.providers.entry("local".into()).or_default();
-            if entry.model.is_none() {
-                // Use the first configured model from the multi-model config
-                if let Some(first_model) = local_config.models.first() {
-                    entry.model = Some(first_model.model_id.clone());
-                }
+            if entry.model.is_none()
+                && let Some(first_model) = local_config.models.first()
+            {
+                entry.model = Some(first_model.model_id.clone());
             }
         }
     }
@@ -392,9 +436,17 @@ pub struct LiveProviderSetupService {
     config: ProvidersConfig,
     token_store: TokenStore,
     key_store: KeyStore,
+    pending_oauth: Arc<RwLock<HashMap<String, PendingOAuthFlow>>>,
     /// When set, local-only providers (local-llm, ollama) are hidden from
     /// the available list because they cannot run on cloud VMs.
     deploy_platform: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingOAuthFlow {
+    provider_name: String,
+    oauth_config: moltis_oauth::OAuthConfig,
+    verifier: String,
 }
 
 impl LiveProviderSetupService {
@@ -408,6 +460,7 @@ impl LiveProviderSetupService {
             config,
             token_store: TokenStore::new(),
             key_store: KeyStore::new(),
+            pending_oauth: Arc::new(RwLock::new(HashMap::new())),
             deploy_platform,
         }
     }
@@ -600,7 +653,14 @@ impl ProviderSetupService for LiveProviderSetupService {
             .ok_or_else(|| "missing 'provider' parameter".to_string())?
             .to_string();
 
-        let oauth_config = load_oauth_config(&provider_name)
+        let redirect_uri = params
+            .get("redirectUri")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned);
+
+        let mut oauth_config = load_oauth_config(&provider_name)
             .ok_or_else(|| format!("no OAuth config for provider: {provider_name}"))?;
 
         if oauth_config.device_flow {
@@ -609,13 +669,36 @@ impl ProviderSetupService for LiveProviderSetupService {
                 .await;
         }
 
+        let use_server_callback = redirect_uri.is_some();
+        if let Some(uri) = redirect_uri {
+            oauth_config.redirect_uri = uri;
+        }
+
         let port = callback_port(&oauth_config);
+        let oauth_config_for_pending = oauth_config.clone();
         let flow = OAuthFlow::new(oauth_config);
         let auth_req = flow.start();
 
         let auth_url = auth_req.url.clone();
         let verifier = auth_req.pkce.verifier.clone();
         let expected_state = auth_req.state.clone();
+
+        // Browser/server callback mode: callback lands on this gateway instance,
+        // then `/auth/callback` completes the exchange with `oauth_complete`.
+        if use_server_callback {
+            let pending = PendingOAuthFlow {
+                provider_name,
+                oauth_config: oauth_config_for_pending,
+                verifier,
+            };
+            self.pending_oauth
+                .write()
+                .await
+                .insert(expected_state, pending);
+            return Ok(serde_json::json!({
+                "authUrl": auth_url,
+            }));
+        }
 
         // Spawn background task to wait for the callback and exchange the code
         let token_store = self.token_store.clone();
@@ -664,6 +747,51 @@ impl ProviderSetupService for LiveProviderSetupService {
 
         Ok(serde_json::json!({
             "authUrl": auth_url,
+        }))
+    }
+
+    async fn oauth_complete(&self, params: Value) -> ServiceResult {
+        let code = params
+            .get("code")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'code' parameter".to_string())?
+            .to_string();
+        let state = params
+            .get("state")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'state' parameter".to_string())?
+            .to_string();
+
+        let pending = self
+            .pending_oauth
+            .write()
+            .await
+            .remove(&state)
+            .ok_or_else(|| "unknown or expired OAuth state".to_string())?;
+
+        let flow = OAuthFlow::new(pending.oauth_config);
+        let tokens = flow
+            .exchange(&code, &pending.verifier)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        self.token_store
+            .save(&pending.provider_name, &tokens)
+            .map_err(|e| e.to_string())?;
+
+        let effective = self.effective_config();
+        let new_registry = ProviderRegistry::from_env_with_config(&effective);
+        let mut reg = self.registry.write().await;
+        *reg = new_registry;
+
+        info!(
+            provider = %pending.provider_name,
+            "OAuth callback complete, rebuilt provider registry"
+        );
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "provider": pending.provider_name,
         }))
     }
 
@@ -875,6 +1003,85 @@ mod tests {
             Some("https://custom.api.com/v1")
         ); // preserved
         assert_eq!(config.model.as_deref(), Some("gpt-4o-mini")); // updated
+    }
+
+    #[test]
+    fn key_store_save_config_preserves_other_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::with_path(dir.path().join("keys.json"));
+
+        store
+            .save_config(
+                "anthropic",
+                Some("sk-anthropic".into()),
+                Some("https://api.anthropic.com".into()),
+                Some("claude-sonnet-4".into()),
+            )
+            .unwrap();
+
+        store
+            .save_config(
+                "openai",
+                Some("sk-openai".into()),
+                Some("https://api.openai.com/v1".into()),
+                Some("gpt-4o".into()),
+            )
+            .unwrap();
+
+        // Update only OpenAI model, Anthropic should remain unchanged.
+        store
+            .save_config("openai", None, None, Some("gpt-5".into()))
+            .unwrap();
+
+        let anthropic = store.load_config("anthropic").unwrap();
+        assert_eq!(anthropic.api_key.as_deref(), Some("sk-anthropic"));
+        assert_eq!(
+            anthropic.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(anthropic.model.as_deref(), Some("claude-sonnet-4"));
+
+        let openai = store.load_config("openai").unwrap();
+        assert_eq!(openai.api_key.as_deref(), Some("sk-openai"));
+        assert_eq!(
+            openai.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(openai.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn key_store_concurrent_writes_do_not_drop_provider_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::with_path(dir.path().join("keys.json"));
+
+        let mut handles = Vec::new();
+        for (provider, key, model) in [
+            ("openai", "sk-openai", "gpt-5"),
+            ("anthropic", "sk-anthropic", "claude-sonnet-4"),
+        ] {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    store
+                        .save_config(
+                            provider,
+                            Some(key.to_string()),
+                            None,
+                            Some(model.to_string()),
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let all = store.load_all_configs();
+        assert!(all.contains_key("openai"));
+        assert!(all.contains_key("anthropic"));
     }
 
     #[test]
@@ -1104,6 +1311,34 @@ mod tests {
             .oauth_start(serde_json::json!({"provider": "nonexistent"}))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn oauth_start_uses_redirect_uri_override() {
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None);
+        let redirect_uri = "https://example.com/auth/callback";
+
+        let result = svc
+            .oauth_start(serde_json::json!({
+                "provider": "openai-codex",
+                "redirectUri": redirect_uri,
+            }))
+            .await
+            .expect("oauth start should succeed");
+        let auth_url = result
+            .get("authUrl")
+            .and_then(|v| v.as_str())
+            .expect("missing authUrl");
+        let parsed = reqwest::Url::parse(auth_url).expect("authUrl should be a valid URL");
+        let redirect = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "redirect_uri")
+            .map(|(_, v)| v.into_owned());
+
+        assert_eq!(redirect.as_deref(), Some(redirect_uri));
     }
 
     #[tokio::test]

@@ -20,15 +20,19 @@ use moltis_config::MessageQueueMode;
 
 use {
     moltis_agents::{
-        AgentRunError,
-        model::StreamEvent,
+        AgentRunError, ChatMessage,
+        model::{StreamEvent, values_to_chat_messages},
         prompt::{build_system_prompt_minimal, build_system_prompt_with_session},
         providers::ProviderRegistry,
         runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::ToolRegistry,
     },
-    moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
+    moltis_sessions::{
+        ContentBlock, MessageContent, PersistedMessage, metadata::SqliteSessionMetadata,
+        store::SessionStore,
+    },
     moltis_skills::discover::SkillDiscoverer,
+    moltis_tools::policy::{ToolPolicy, profile_tools},
 };
 
 use crate::{
@@ -38,11 +42,142 @@ use crate::{
     state::GatewayState,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ReplyMedium {
+    Text,
+    Voice,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputChannelMeta {
+    #[serde(default)]
+    message_kind: Option<InputMessageKind>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum InputMessageKind {
+    Text,
+    Voice,
+    Audio,
+    Photo,
+    Document,
+    Video,
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InputMediumParam {
+    Text,
+    Voice,
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn parse_input_medium(params: &Value) -> Option<ReplyMedium> {
+    match params
+        .get("_input_medium")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<InputMediumParam>(v).ok())
+    {
+        Some(InputMediumParam::Voice) => Some(ReplyMedium::Voice),
+        Some(InputMediumParam::Text) => Some(ReplyMedium::Text),
+        _ => None,
+    }
+}
+
+fn explicit_reply_medium_override(text: &str) -> Option<ReplyMedium> {
+    let lower = text.to_lowercase();
+    let voice_markers = [
+        "talk to me",
+        "say it",
+        "say this",
+        "speak",
+        "voice message",
+        "respond with voice",
+        "reply with voice",
+        "audio reply",
+    ];
+    if voice_markers.iter().any(|m| lower.contains(m)) {
+        return Some(ReplyMedium::Voice);
+    }
+
+    let text_markers = [
+        "text only",
+        "reply in text",
+        "respond in text",
+        "don't use voice",
+        "do not use voice",
+        "no audio",
+    ];
+    if text_markers.iter().any(|m| lower.contains(m)) {
+        return Some(ReplyMedium::Text);
+    }
+
+    None
+}
+
+fn infer_reply_medium(params: &Value, text: &str) -> ReplyMedium {
+    if let Some(explicit) = explicit_reply_medium_override(text) {
+        return explicit;
+    }
+
+    if let Some(input_medium) = parse_input_medium(params) {
+        return input_medium;
+    }
+
+    if let Some(channel) = params
+        .get("channel")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<InputChannelMeta>(v).ok())
+        && channel.message_kind == Some(InputMessageKind::Voice)
+    {
+        return ReplyMedium::Voice;
+    }
+
+    ReplyMedium::Text
+}
+
+fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
+    let mut effective = ToolPolicy::default();
+    if let Some(profile) = config.tools.policy.profile.as_deref()
+        && !profile.is_empty()
+    {
+        effective = effective.merge_with(&profile_tools(profile));
+    }
+    let configured = ToolPolicy {
+        allow: config.tools.policy.allow.clone(),
+        deny: config.tools.policy.deny.clone(),
+    };
+    effective.merge_with(&configured)
+}
+
+fn apply_runtime_tool_filters(
+    base: &ToolRegistry,
+    config: &moltis_config::MoltisConfig,
+    _skills: &[moltis_skills::types::SkillMetadata],
+    mcp_disabled: bool,
+) -> ToolRegistry {
+    let base_registry = if mcp_disabled {
+        base.clone_without_mcp()
+    } else {
+        base.clone_without(&[])
+    };
+
+    let policy = effective_tool_policy(config);
+    // NOTE: Do not globally restrict tools by discovered skill `allowed_tools`.
+    // Skills are always discovered for prompt injection; applying those lists at
+    // runtime can unintentionally remove unrelated tools (for example, leaving
+    // only `web_fetch` and preventing `create_skill` from being called).
+    // Tool availability here is controlled by configured runtime policy.
+    base_registry.clone_allowed_by(|name| policy.is_allowed(name))
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -240,7 +375,16 @@ impl LiveChatService {
         // assume tools are present (conservative — enables tool mode).
         self.tool_registry
             .try_read()
-            .map(|r| !r.list_schemas().is_empty())
+            .map(|r| {
+                let schemas = r.list_schemas();
+                let has = !schemas.is_empty();
+                tracing::debug!(
+                    tool_count = schemas.len(),
+                    has_tools = has,
+                    "has_tools_sync check"
+                );
+                has
+            })
             .unwrap_or(true)
     }
 
@@ -301,11 +445,57 @@ impl LiveChatService {
 #[async_trait]
 impl ChatService for LiveChatService {
     async fn send(&self, params: Value) -> ServiceResult {
-        let text = params
-            .get("text")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'text' parameter".to_string())?
-            .to_string();
+        // Support both text-only and multimodal content.
+        // - "text": string → plain text message
+        // - "content": array → multimodal content (text + images)
+        let (text, message_content) = if let Some(content) = params.get("content") {
+            // Multimodal content - extract text for logging/hooks, parse into typed blocks
+            let text_part = content
+                .as_array()
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .and_then(|block| block.get("text").and_then(|t| t.as_str()))
+                })
+                .unwrap_or("[Image]")
+                .to_string();
+
+            // Parse JSON blocks into typed ContentBlock structs
+            let blocks: Vec<ContentBlock> = content
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|block| {
+                            let block_type = block.get("type")?.as_str()?;
+                            match block_type {
+                                "text" => {
+                                    let text = block.get("text")?.as_str()?.to_string();
+                                    Some(ContentBlock::text(text))
+                                },
+                                "image_url" => {
+                                    let url = block.get("image_url")?.get("url")?.as_str()?;
+                                    Some(ContentBlock::ImageUrl {
+                                        image_url: moltis_sessions::message::ImageUrl {
+                                            url: url.to_string(),
+                                        },
+                                    })
+                                },
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (text_part, MessageContent::Multimodal(blocks))
+        } else {
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing 'text' or 'content' parameter".to_string())?
+                .to_string();
+            (text.clone(), MessageContent::Text(text))
+        };
+        let desired_reply_medium = infer_reply_medium(&params, &text);
 
         let conn_id = params
             .get("_conn_id")
@@ -317,7 +507,14 @@ impl ChatService for LiveChatService {
             .get("stream_only")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let stream_only = explicit_stream_only || !self.has_tools_sync();
+        let has_tools = self.has_tools_sync();
+        let stream_only = explicit_stream_only || !has_tools;
+        tracing::debug!(
+            explicit_stream_only,
+            has_tools,
+            stream_only,
+            "send() mode decision"
+        );
 
         // Resolve session key: explicit override (used by cron callbacks) or connection-scoped lookup.
         let session_key = match params.get("_session_key").and_then(|v| v.as_str()) {
@@ -371,6 +568,23 @@ impl ChatService for LiveChatService {
                 primary
             }
         };
+
+        // Check if this is a local model that needs downloading.
+        // Only do this check for local-llm providers.
+        #[cfg(feature = "local-llm")]
+        if provider.name() == "local-llm" {
+            let model_to_check = model_id.unwrap_or(provider.id());
+            tracing::info!(
+                provider_name = provider.name(),
+                model_to_check,
+                "checking local model cache"
+            );
+            if let Err(e) =
+                crate::local_llm_setup::ensure_local_model_cached(model_to_check, &self.state).await
+            {
+                return Err(format!("Failed to prepare local model: {}", e));
+            }
+        }
 
         // Resolve project context for this connection's active project.
         let project_context = {
@@ -466,12 +680,16 @@ impl ChatService for LiveChatService {
 
         // Persist the user message (with optional channel metadata for UI display).
         let channel_meta = params.get("channel").cloned();
-        let mut user_msg =
-            serde_json::json!({"role": "user", "content": &text, "created_at": now_ms()});
-        if let Some(ch) = &channel_meta {
-            user_msg["channel"] = ch.clone();
-        }
-        if let Err(e) = self.session_store.append(&session_key, &user_msg).await {
+        let user_msg = PersistedMessage::User {
+            content: message_content,
+            created_at: Some(now_ms()),
+            channel: channel_meta,
+        };
+        if let Err(e) = self
+            .session_store
+            .append(&session_key, &user_msg.to_value())
+            .await
+        {
             warn!("failed to persist user message: {e}");
         }
 
@@ -509,7 +727,11 @@ impl ChatService for LiveChatService {
             // Only echo to channel if this is the active session for this chat.
             let is_active = self
                 .session_metadata
-                .get_active_session(&target.channel_type, &target.account_id, &target.chat_id)
+                .get_active_session(
+                    target.channel_type.as_str(),
+                    &target.account_id,
+                    &target.chat_id,
+                )
                 .await
                 .map(|k| k == session_key)
                 .unwrap_or(true);
@@ -523,8 +745,7 @@ impl ChatService for LiveChatService {
         }
 
         // Discover enabled skills/plugins for prompt injection.
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
+        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
         let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
         let discovered_skills = match discoverer.discover().await {
             Ok(s) => s,
@@ -566,6 +787,7 @@ impl ChatService for LiveChatService {
             model = provider.id(),
             stream_only,
             session = %session_key,
+            reply_medium = ?desired_reply_medium,
             "chat.send"
         );
 
@@ -740,6 +962,7 @@ impl ChatService for LiveChatService {
                         &provider_name,
                         &history,
                         &session_key_clone,
+                        desired_reply_medium,
                         ctx_ref,
                         stats_ref,
                         user_message_index,
@@ -756,6 +979,7 @@ impl ChatService for LiveChatService {
                         &provider_name,
                         &history,
                         &session_key_clone,
+                        desired_reply_medium,
                         ctx_ref,
                         stats_ref,
                         user_message_index,
@@ -811,9 +1035,15 @@ impl ChatService for LiveChatService {
 
             // Persist assistant response.
             if let Some((response_text, input_tokens, output_tokens)) = assistant_text {
-                let assistant_msg = serde_json::json!({"role": "assistant", "content": response_text, "model": model_id, "provider": provider_name, "inputTokens": input_tokens, "outputTokens": output_tokens, "created_at": now_ms()});
+                let assistant_msg = PersistedMessage::assistant(
+                    response_text,
+                    &model_id,
+                    &provider_name,
+                    input_tokens,
+                    output_tokens,
+                );
                 if let Err(e) = session_store
-                    .append(&session_key_clone, &assistant_msg)
+                    .append(&session_key_clone, &assistant_msg.to_value())
                     .await
                 {
                     warn!("failed to persist assistant message: {e}");
@@ -881,6 +1111,7 @@ impl ChatService for LiveChatService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'text' parameter".to_string())?
             .to_string();
+        let desired_reply_medium = infer_reply_medium(&params, &text);
 
         let explicit_model = params.get("model").and_then(|v| v.as_str());
         let stream_only = !self.has_tools_sync();
@@ -907,9 +1138,12 @@ impl ChatService for LiveChatService {
         };
 
         // Persist the user message.
-        let user_msg =
-            serde_json::json!({"role": "user", "content": &text, "created_at": now_ms()});
-        if let Err(e) = self.session_store.append(&session_key, &user_msg).await {
+        let user_msg = PersistedMessage::user(&text);
+        if let Err(e) = self
+            .session_store
+            .append(&session_key, &user_msg.to_value())
+            .await
+        {
             warn!("send_sync: failed to persist user message: {e}");
         }
 
@@ -941,6 +1175,7 @@ impl ChatService for LiveChatService {
             model = %model_id,
             stream_only,
             session = %session_key,
+            reply_medium = ?desired_reply_medium,
             "chat.send_sync"
         );
 
@@ -953,6 +1188,7 @@ impl ChatService for LiveChatService {
                 &provider_name,
                 &history,
                 &session_key,
+                desired_reply_medium,
                 None,
                 None,
                 user_message_index,
@@ -969,6 +1205,7 @@ impl ChatService for LiveChatService {
                 &provider_name,
                 &history,
                 &session_key,
+                desired_reply_medium,
                 None,
                 None,
                 user_message_index,
@@ -983,18 +1220,16 @@ impl ChatService for LiveChatService {
 
         // Persist assistant response.
         if let Some((ref response_text, input_tokens, output_tokens)) = result {
-            let assistant_msg = serde_json::json!({
-                "role": "assistant",
-                "content": response_text,
-                "model": model_id,
-                "provider": provider_name,
-                "inputTokens": input_tokens,
-                "outputTokens": output_tokens,
-                "created_at": now_ms(),
-            });
+            let assistant_msg = PersistedMessage::assistant(
+                response_text,
+                &model_id,
+                &provider_name,
+                input_tokens,
+                output_tokens,
+            );
             if let Err(e) = self
                 .session_store
-                .append(&session_key, &assistant_msg)
+                .append(&session_key, &assistant_msg.to_value())
                 .await
             {
                 warn!("send_sync: failed to persist assistant message: {e}");
@@ -1019,12 +1254,11 @@ impl ChatService for LiveChatService {
                     .unwrap_or_else(|| "agent run failed (check server logs)".to_string());
 
                 // Persist the error in the session so it's visible in session history.
-                let error_entry = serde_json::json!({
-                    "role": "system",
-                    "content": format!("[error] {error_msg}"),
-                    "created_at": now_ms(),
-                });
-                let _ = self.session_store.append(&session_key, &error_entry).await;
+                let error_entry = PersistedMessage::system(format!("[error] {error_msg}"));
+                let _ = self
+                    .session_store
+                    .append(&session_key, &error_entry.to_value())
+                    .await;
                 // Update metadata so the session shows in the UI.
                 if let Ok(count) = self.session_store.count(&session_key).await {
                     self.session_metadata.touch(&session_key, count).await;
@@ -1125,9 +1359,10 @@ impl ChatService for LiveChatService {
         if let Some(ref mm) = self.state.memory_manager {
             let memory_dir = moltis_config::data_dir();
             if let Ok(provider) = self.resolve_provider(&session_key, &history).await {
+                let chat_history_for_memory = values_to_chat_messages(&history);
                 match moltis_agents::silent_turn::run_silent_memory_turn(
                     provider,
-                    &history,
+                    &chat_history_for_memory,
                     &memory_dir,
                 )
                 .await
@@ -1151,12 +1386,6 @@ impl ChatService for LiveChatService {
         }
 
         // Build a summary prompt from the conversation.
-        let mut summary_messages: Vec<serde_json::Value> = Vec::new();
-        summary_messages.push(serde_json::json!({
-            "role": "system",
-            "content": "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble."
-        }));
-
         let mut conversation_text = String::new();
         for msg in &history {
             let role = msg
@@ -1166,10 +1395,13 @@ impl ChatService for LiveChatService {
             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
             conversation_text.push_str(&format!("{role}: {content}\n\n"));
         }
-        summary_messages.push(serde_json::json!({
-            "role": "user",
-            "content": conversation_text,
-        }));
+
+        let summary_messages = vec![
+            ChatMessage::system(
+                "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble.",
+            ),
+            ChatMessage::user(&conversation_text),
+        ];
 
         // Use the session's model if available, otherwise fall back to the model
         // from the last assistant message, then to the first registered provider.
@@ -1196,11 +1428,16 @@ impl ChatService for LiveChatService {
         }
 
         // Replace history with a single assistant message containing the summary.
-        let compacted = vec![serde_json::json!({
-            "role": "assistant",
-            "content": format!("[Conversation Summary]\n\n{summary}"),
-            "created_at": now_ms(),
-        })];
+        let compacted_msg = PersistedMessage::Assistant {
+            content: format!("[Conversation Summary]\n\n{summary}"),
+            created_at: Some(now_ms()),
+            model: None,
+            provider: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: None,
+        };
+        let compacted = vec![compacted_msg.to_value()];
 
         self.session_store
             .replace_history(&session_key, compacted.clone())
@@ -1211,8 +1448,7 @@ impl ChatService for LiveChatService {
 
         // Save compaction summary to memory file and trigger sync.
         if let Some(ref mm) = self.state.memory_manager {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let memory_dir = cwd.join("memory");
+            let memory_dir = moltis_config::data_dir().join("memory");
             if let Err(e) = tokio::fs::create_dir_all(&memory_dir).await {
                 warn!(error = %e, "compact: failed to create memory dir");
             } else {
@@ -1353,15 +1589,11 @@ impl ChatService for LiveChatService {
             .as_ref()
             .and_then(|e| e.mcp_disabled)
             .unwrap_or(false);
+        let config = moltis_config::discover_and_load();
         let tools: Vec<serde_json::Value> = if supports_tools {
             let registry_guard = self.tool_registry.read().await;
-            let filtered;
-            let effective_registry: &ToolRegistry = if mcp_disabled {
-                filtered = registry_guard.clone_without_mcp();
-                &filtered
-            } else {
-                &registry_guard
-            };
+            let effective_registry =
+                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled);
             effective_registry
                 .list_schemas()
                 .iter()
@@ -1441,8 +1673,7 @@ impl ChatService for LiveChatService {
 
         // Discover enabled skills/plugins (only if provider supports tools)
         let skills_list: Vec<serde_json::Value> = if supports_tools {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
+            let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
             let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
             match discoverer.discover().await {
                 Ok(s) => s
@@ -1501,8 +1732,9 @@ async fn run_with_tools(
     tool_registry: &Arc<RwLock<ToolRegistry>>,
     text: &str,
     provider_name: &str,
-    history: &[serde_json::Value],
+    history_raw: &[serde_json::Value],
     session_key: &str,
+    desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
     session_context: Option<&str>,
     user_message_index: usize,
@@ -1514,39 +1746,78 @@ async fn run_with_tools(
 ) -> Option<(String, u32, u32)> {
     // Load identity and user profile from config so the LLM knows who it is.
     let config = moltis_config::discover_and_load();
+    let mut identity = config.identity.clone();
+    if let Some(file_identity) = moltis_config::load_identity() {
+        if file_identity.name.is_some() {
+            identity.name = file_identity.name;
+        }
+        if file_identity.emoji.is_some() {
+            identity.emoji = file_identity.emoji;
+        }
+        if file_identity.creature.is_some() {
+            identity.creature = file_identity.creature;
+        }
+        if file_identity.vibe.is_some() {
+            identity.vibe = file_identity.vibe;
+        }
+    }
+    let mut user = config.user.clone();
+    if let Some(file_user) = moltis_config::load_user() {
+        if file_user.name.is_some() {
+            user.name = file_user.name;
+        }
+        if file_user.timezone.is_some() {
+            user.timezone = file_user.timezone;
+        }
+    }
+    let soul_text = moltis_config::load_soul();
+    let agents_text = moltis_config::load_agents_md();
+    let tools_text = moltis_config::load_tools_md();
 
     let native_tools = provider.supports_tools();
+
+    let filtered_registry = {
+        let registry_guard = tool_registry.read().await;
+        if native_tools {
+            apply_runtime_tool_filters(&registry_guard, &config, skills, mcp_disabled)
+        } else {
+            registry_guard.clone_without(&[])
+        }
+    };
 
     // Use a minimal prompt without tool schemas for providers that don't support tools.
     // This reduces context size and avoids confusing the LLM with unusable instructions.
     let system_prompt = if native_tools {
-        let registry_guard = tool_registry.read().await;
-        let owned_filtered;
-        let tools_for_prompt: &ToolRegistry = if mcp_disabled {
-            owned_filtered = registry_guard.clone_without_mcp();
-            &owned_filtered
-        } else {
-            &registry_guard
-        };
-        let prompt = build_system_prompt_with_session(
-            tools_for_prompt,
+        build_system_prompt_with_session(
+            &filtered_registry,
             native_tools,
             project_context,
             session_context,
             skills,
-            Some(&config.identity),
-            Some(&config.user),
-        );
-        drop(registry_guard);
-        prompt
+            Some(&identity),
+            Some(&user),
+            soul_text.as_deref(),
+            agents_text.as_deref(),
+            tools_text.as_deref(),
+        )
     } else {
         // Minimal prompt without tools for local LLMs
         build_system_prompt_minimal(
             project_context,
             session_context,
-            Some(&config.identity),
-            Some(&config.user),
+            Some(&identity),
+            Some(&user),
+            soul_text.as_deref(),
+            agents_text.as_deref(),
+            tools_text.as_deref(),
         )
+    };
+
+    // Determine if this session is sandboxed (for browser tool execution mode)
+    let session_is_sandboxed = if let Some(ref router) = state.sandbox_router {
+        router.is_sandboxed(session_key).await
+    } else {
+        false
     };
 
     // Broadcast tool events to the UI as they happen.
@@ -1573,14 +1844,40 @@ async fn run_with_tools(
                     id,
                     name,
                     arguments,
-                } => serde_json::json!({
-                    "runId": run_id,
-                    "sessionKey": sk,
-                    "state": "tool_call_start",
-                    "toolCallId": id,
-                    "toolName": name,
-                    "arguments": arguments,
-                }),
+                } => {
+                    // Send tool status to channels (Telegram, etc.)
+                    let state_clone = Arc::clone(&state);
+                    let sk_clone = sk.clone();
+                    let name_clone = name.clone();
+                    let args_clone = arguments.clone();
+                    tokio::spawn(async move {
+                        send_tool_status_to_channels(
+                            &state_clone,
+                            &sk_clone,
+                            &name_clone,
+                            &args_clone,
+                        )
+                        .await;
+                    });
+
+                    let mut payload = serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "tool_call_start",
+                        "toolCallId": id,
+                        "toolName": name,
+                        "arguments": arguments,
+                    });
+                    // Add execution mode for browser tool (follows session sandbox mode)
+                    if name == "browser" {
+                        payload["executionMode"] = serde_json::json!(if session_is_sandboxed {
+                            "sandbox"
+                        } else {
+                            "host"
+                        });
+                    }
+                    payload
+                },
                 RunnerEvent::ToolCallEnd {
                     id,
                     name,
@@ -1599,6 +1896,14 @@ async fn run_with_tools(
                     if let Some(err) = error {
                         payload["error"] = serde_json::json!(parse_chat_error(err, None));
                     }
+                    // Check for screenshot to send to channel (Telegram, etc.)
+                    let screenshot_to_send = result
+                        .as_ref()
+                        .and_then(|r| r.get("screenshot"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| s.starts_with("data:image/"))
+                        .map(String::from);
+
                     if let Some(res) = result {
                         // Cap output sent to the UI to avoid huge WS frames.
                         let mut capped = res.clone();
@@ -1616,6 +1921,17 @@ async fn run_with_tools(
                         }
                         payload["result"] = capped;
                     }
+
+                    // Send screenshot to channel targets (Telegram) if present
+                    if let Some(screenshot_data) = screenshot_to_send {
+                        let state_clone = Arc::clone(&state);
+                        let sk_clone = sk.clone();
+                        tokio::spawn(async move {
+                            send_screenshot_to_channels(&state_clone, &sk_clone, &screenshot_data)
+                                .await;
+                        });
+                    }
+
                     payload
                 },
                 RunnerEvent::ThinkingText(text) => serde_json::json!({
@@ -1665,32 +1981,29 @@ async fn run_with_tools(
         });
     });
 
-    // Pass history (excluding the current user message, which run_agent_loop adds).
-    let hist = if history.is_empty() {
+    // Convert persisted JSON history to typed ChatMessages for the LLM provider.
+    let chat_history = values_to_chat_messages(history_raw);
+    let hist = if chat_history.is_empty() {
         None
     } else {
-        Some(history.to_vec())
+        Some(chat_history)
     };
 
-    // Inject session key and accept-language into tool call params so tools can
+    // Inject session key, sandbox mode, and accept-language into tool call params so tools can
     // resolve per-session state and forward the user's locale to web requests.
-    let mut tool_context = serde_json::json!({ "_session_key": session_key });
+    // The browser tool uses _sandbox to determine whether to run in a container.
+    let mut tool_context = serde_json::json!({
+        "_session_key": session_key,
+        "_sandbox": session_is_sandboxed,
+    });
     if let Some(lang) = accept_language.as_deref() {
         tool_context["_accept_language"] = serde_json::json!(lang);
     }
 
     let provider_ref = provider.clone();
-    let registry_guard = tool_registry.read().await;
-    let owned_filtered_loop;
-    let tools_for_loop: &ToolRegistry = if mcp_disabled {
-        owned_filtered_loop = registry_guard.clone_without_mcp();
-        &owned_filtered_loop
-    } else {
-        &registry_guard
-    };
     let first_result = run_agent_loop_streaming(
         provider,
-        tools_for_loop,
+        &filtered_registry,
         &system_prompt,
         text,
         Some(&on_event),
@@ -1743,16 +2056,17 @@ async fn run_with_tools(
                     .await;
 
                     // Reload compacted history and retry.
-                    let compacted_history = store.read(session_key).await.unwrap_or_default();
-                    let retry_hist = if compacted_history.is_empty() {
+                    let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
+                    let compacted_chat = values_to_chat_messages(&compacted_history_raw);
+                    let retry_hist = if compacted_chat.is_empty() {
                         None
                     } else {
-                        Some(compacted_history)
+                        Some(compacted_chat)
                     };
 
                     run_agent_loop_streaming(
                         provider_ref.clone(),
-                        tools_for_loop,
+                        &filtered_registry,
                         &system_prompt,
                         text,
                         Some(&on_event),
@@ -1810,6 +2124,7 @@ async fn run_with_tools(
                     "inputTokens": result.usage.input_tokens,
                     "outputTokens": result.usage.output_tokens,
                     "messageIndex": assistant_message_index,
+                    "replyMedium": desired_reply_medium,
                 }),
                 BroadcastOpts::default(),
             )
@@ -1820,7 +2135,7 @@ async fn run_with_tools(
                 tracing::info!("push: checking push notification (agent mode)");
                 send_chat_push_notification(state, session_key, &result.text).await;
             }
-            deliver_channel_replies(state, session_key, &result.text).await;
+            deliver_channel_replies(state, session_key, &result.text, desired_reply_medium).await;
             Some((
                 result.text,
                 result.usage.input_tokens,
@@ -1863,11 +2178,6 @@ async fn compact_session(
         return Err("nothing to compact".into());
     }
 
-    let mut summary_messages: Vec<serde_json::Value> = vec![serde_json::json!({
-        "role": "system",
-        "content": "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble."
-    })];
-
     let mut conversation_text = String::new();
     for msg in &history {
         let role = msg
@@ -1877,10 +2187,13 @@ async fn compact_session(
         let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
         conversation_text.push_str(&format!("{role}: {content}\n\n"));
     }
-    summary_messages.push(serde_json::json!({
-        "role": "user",
-        "content": conversation_text,
-    }));
+
+    let summary_messages = vec![
+        ChatMessage::system(
+            "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble.",
+        ),
+        ChatMessage::user(&conversation_text),
+    ];
 
     let mut stream = provider.stream(summary_messages);
     let mut summary = String::new();
@@ -1900,11 +2213,16 @@ async fn compact_session(
         return Err("compact produced empty summary".into());
     }
 
-    let compacted = vec![serde_json::json!({
-        "role": "assistant",
-        "content": format!("[Conversation Summary]\n\n{summary}"),
-        "created_at": now_ms(),
-    })];
+    let compacted_msg = PersistedMessage::Assistant {
+        content: format!("[Conversation Summary]\n\n{summary}"),
+        created_at: Some(now_ms()),
+        model: None,
+        provider: None,
+        input_tokens: None,
+        output_tokens: None,
+        tool_calls: None,
+    };
+    let compacted = vec![compacted_msg.to_value()];
 
     store
         .replace_history(session_key, compacted)
@@ -1922,40 +2240,30 @@ async fn run_streaming(
     provider: Arc<dyn moltis_agents::model::LlmProvider>,
     text: &str,
     provider_name: &str,
-    history: &[serde_json::Value],
+    history_raw: &[serde_json::Value],
     session_key: &str,
+    desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
     session_context: Option<&str>,
     user_message_index: usize,
     skills: &[moltis_skills::types::SkillMetadata],
 ) -> Option<(String, u32, u32)> {
-    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let mut messages: Vec<ChatMessage> = Vec::new();
     // Prepend session + project context as system messages.
     if let Some(ctx) = session_context {
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": format!("## Current Session\n\n{ctx}"),
-        }));
+        messages.push(ChatMessage::system(format!("## Current Session\n\n{ctx}")));
     }
     if let Some(ctx) = project_context {
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": ctx,
-        }));
+        messages.push(ChatMessage::system(ctx));
     }
     // Inject skills into the system prompt for streaming mode too.
     if !skills.is_empty() {
         let skills_block = moltis_skills::prompt_gen::generate_skills_prompt(skills);
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": skills_block,
-        }));
+        messages.push(ChatMessage::system(skills_block));
     }
-    messages.extend_from_slice(history);
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": text,
-    }));
+    // Convert persisted JSON history to typed ChatMessages for the LLM provider.
+    messages.extend(values_to_chat_messages(history_raw));
+    messages.push(ChatMessage::user(text));
 
     let mut stream = provider.stream(messages);
     let mut accumulated = String::new();
@@ -1998,6 +2306,7 @@ async fn run_streaming(
                         "inputTokens": usage.input_tokens,
                         "outputTokens": usage.output_tokens,
                         "messageIndex": assistant_message_index,
+                        "replyMedium": desired_reply_medium,
                     }),
                     BroadcastOpts::default(),
                 )
@@ -2008,7 +2317,8 @@ async fn run_streaming(
                     tracing::info!("push: checking push notification");
                     send_chat_push_notification(state, session_key, &accumulated).await;
                 }
-                deliver_channel_replies(state, session_key, &accumulated).await;
+                deliver_channel_replies(state, session_key, &accumulated, desired_reply_medium)
+                    .await;
                 return Some((accumulated, usage.input_tokens, usage.output_tokens));
             },
             StreamEvent::Error(msg) => {
@@ -2095,7 +2405,12 @@ async fn send_chat_push_notification(state: &Arc<GatewayState>, session_key: &st
 /// response text back to each originating channel via outbound.
 /// Each delivery runs in its own spawned task so slow network calls
 /// don't block each other or the chat pipeline.
-async fn deliver_channel_replies(state: &Arc<GatewayState>, session_key: &str, text: &str) {
+async fn deliver_channel_replies(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    text: &str,
+    desired_reply_medium: ReplyMedium,
+) {
     let targets = state.drain_channel_replies(session_key).await;
     if targets.is_empty() || text.is_empty() {
         return;
@@ -2104,35 +2419,488 @@ async fn deliver_channel_replies(state: &Arc<GatewayState>, session_key: &str, t
         Some(o) => o,
         None => return,
     };
+    deliver_channel_replies_to_targets(
+        outbound,
+        targets,
+        session_key,
+        text,
+        Arc::clone(state),
+        desired_reply_medium,
+    )
+    .await;
+}
+
+async fn deliver_channel_replies_to_targets(
+    outbound: Arc<dyn moltis_channels::plugin::ChannelOutbound>,
+    targets: Vec<moltis_channels::ChannelReplyTarget>,
+    session_key: &str,
+    text: &str,
+    state: Arc<GatewayState>,
+    desired_reply_medium: ReplyMedium,
+) {
+    let session_key = session_key.to_string();
     let text = text.to_string();
+    let mut tasks = Vec::with_capacity(targets.len());
     for target in targets {
         let outbound = Arc::clone(&outbound);
+        let state = Arc::clone(&state);
+        let session_key = session_key.clone();
         let text = text.clone();
+        tasks.push(tokio::spawn(async move {
+            let tts_payload = match desired_reply_medium {
+                ReplyMedium::Voice => build_tts_payload(&state, &session_key, &target, &text).await,
+                ReplyMedium::Text => None,
+            };
+            match target.channel_type {
+                moltis_channels::ChannelType::Telegram => match tts_payload {
+                    Some(payload) => {
+                        if let Err(e) = outbound
+                            .send_media(&target.account_id, &target.chat_id, &payload)
+                            .await
+                        {
+                            warn!(
+                                account_id = target.account_id,
+                                chat_id = target.chat_id,
+                                "failed to send channel voice reply: {e}"
+                            );
+                        }
+                    },
+                    None => {
+                        if let Err(e) = outbound
+                            .send_text(&target.account_id, &target.chat_id, &text)
+                            .await
+                        {
+                            warn!(
+                                account_id = target.account_id,
+                                chat_id = target.chat_id,
+                                "failed to send channel reply: {e}"
+                            );
+                        }
+                    },
+                },
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel reply task join failed");
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TtsStatusResponse {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TtsConvertRequest<'a> {
+    text: &'a str,
+    format: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "voiceId")]
+    voice_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TtsConvertResponse {
+    audio: String,
+    #[serde(default)]
+    mime_type: Option<String>,
+}
+
+async fn build_tts_payload(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    target: &moltis_channels::ChannelReplyTarget,
+    text: &str,
+) -> Option<moltis_common::types::ReplyPayload> {
+    use moltis_common::types::{MediaAttachment, ReplyPayload};
+
+    let tts_status = state.services.tts.status().await.ok()?;
+    let status: TtsStatusResponse = serde_json::from_value(tts_status).ok()?;
+    if !status.enabled {
+        return None;
+    }
+
+    let channel_key = format!("{}:{}", target.channel_type.as_str(), target.account_id);
+    let channel_override = {
+        state
+            .tts_channel_overrides
+            .read()
+            .await
+            .get(&channel_key)
+            .cloned()
+    };
+    let session_override = {
+        state
+            .tts_session_overrides
+            .read()
+            .await
+            .get(session_key)
+            .cloned()
+    };
+    let resolved = channel_override.or(session_override);
+
+    let request = TtsConvertRequest {
+        text,
+        format: "ogg",
+        provider: resolved.as_ref().and_then(|o| o.provider.clone()),
+        voice_id: resolved.as_ref().and_then(|o| o.voice_id.clone()),
+        model: resolved.as_ref().and_then(|o| o.model.clone()),
+    };
+
+    let tts_result = state
+        .services
+        .tts
+        .convert(serde_json::to_value(request).ok()?)
+        .await
+        .ok()?;
+
+    let response: TtsConvertResponse = serde_json::from_value(tts_result).ok()?;
+
+    let mime_type = response
+        .mime_type
+        .unwrap_or_else(|| "audio/ogg".to_string());
+
+    Some(ReplyPayload {
+        text: String::new(),
+        media: Some(MediaAttachment {
+            url: format!("data:{mime_type};base64,{}", response.audio),
+            mime_type,
+        }),
+        reply_to_id: None,
+        silent: false,
+    })
+}
+
+/// Send a tool execution status to all pending channel targets for a session.
+/// Uses `peek_channel_replies` so targets remain for the final text response.
+async fn send_tool_status_to_channels(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) {
+    let targets = state.peek_channel_replies(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let outbound = match state.services.channel_outbound_arc() {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Format a concise tool execution message
+    let message = format_tool_status_message(tool_name, arguments);
+
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let message = message.clone();
         tokio::spawn(async move {
-            match target.channel_type.as_str() {
-                "telegram" => {
-                    if let Err(e) = outbound
-                        .send_text(&target.account_id, &target.chat_id, &text)
-                        .await
-                    {
-                        warn!(
-                            account_id = target.account_id,
-                            chat_id = target.chat_id,
-                            "failed to send channel reply: {e}"
-                        );
-                    }
-                },
-                other => {
-                    warn!(channel_type = other, "unsupported channel type for reply");
-                },
+            // Send as a silent message to avoid notification spam
+            if let Err(e) = outbound
+                .send_text_silent(&target.account_id, &target.chat_id, &message)
+                .await
+            {
+                debug!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    "failed to send tool status to channel: {e}"
+                );
+            } else {
+                // Re-send typing indicator after status message
+                // (sending a message clears the typing indicator in Telegram)
+                debug!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    "sent tool status, re-sending typing indicator"
+                );
+                if let Err(e) = outbound
+                    .send_typing(&target.account_id, &target.chat_id)
+                    .await
+                {
+                    debug!(
+                        account_id = target.account_id,
+                        chat_id = target.chat_id,
+                        "failed to re-send typing after tool status: {e}"
+                    );
+                }
             }
         });
     }
 }
 
+/// Format a human-readable tool execution message.
+fn format_tool_status_message(tool_name: &str, arguments: &serde_json::Value) -> String {
+    match tool_name {
+        "browser" => {
+            let action = arguments
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let url = arguments.get("url").and_then(|v| v.as_str());
+            let ref_ = arguments.get("ref_").and_then(|v| v.as_u64());
+
+            match action {
+                "navigate" => {
+                    if let Some(u) = url {
+                        format!("🌐 Navigating to {}", truncate_url(u))
+                    } else {
+                        "🌐 Navigating...".to_string()
+                    }
+                },
+                "screenshot" => "📸 Taking screenshot...".to_string(),
+                "snapshot" => "📋 Getting page snapshot...".to_string(),
+                "click" => {
+                    if let Some(r) = ref_ {
+                        format!("👆 Clicking element #{}", r)
+                    } else {
+                        "👆 Clicking...".to_string()
+                    }
+                },
+                "type" => "⌨️ Typing...".to_string(),
+                "scroll" => "📜 Scrolling...".to_string(),
+                "evaluate" => "⚡ Running JavaScript...".to_string(),
+                "wait" => "⏳ Waiting for element...".to_string(),
+                "close" => "🚪 Closing browser...".to_string(),
+                _ => format!("🌐 Browser: {}", action),
+            }
+        },
+        "exec" => {
+            let command = arguments.get("command").and_then(|v| v.as_str());
+            if let Some(cmd) = command {
+                // Show first ~50 chars of command
+                let display_cmd = if cmd.len() > 50 {
+                    format!("{}...", &cmd[..50])
+                } else {
+                    cmd.to_string()
+                };
+                format!("💻 Running: `{}`", display_cmd)
+            } else {
+                "💻 Executing command...".to_string()
+            }
+        },
+        "web_fetch" => {
+            let url = arguments.get("url").and_then(|v| v.as_str());
+            if let Some(u) = url {
+                format!("🔗 Fetching {}", truncate_url(u))
+            } else {
+                "🔗 Fetching URL...".to_string()
+            }
+        },
+        "web_search" => {
+            let query = arguments.get("query").and_then(|v| v.as_str());
+            if let Some(q) = query {
+                let display_q = if q.len() > 40 {
+                    format!("{}...", &q[..40])
+                } else {
+                    q.to_string()
+                };
+                format!("🔍 Searching: {}", display_q)
+            } else {
+                "🔍 Searching...".to_string()
+            }
+        },
+        "memory_search" => "🧠 Searching memory...".to_string(),
+        "memory_store" => "🧠 Storing to memory...".to_string(),
+        _ => format!("🔧 {}", tool_name),
+    }
+}
+
+/// Truncate a URL for display (show domain + short path).
+fn truncate_url(url: &str) -> String {
+    // Try to extract domain from URL
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    // Take first 50 chars max
+    if without_scheme.len() > 50 {
+        format!("{}...", &without_scheme[..50])
+    } else {
+        without_scheme.to_string()
+    }
+}
+
+/// Send a screenshot to all pending channel targets for a session.
+/// Uses `peek_channel_replies` so targets remain for the final text response.
+async fn send_screenshot_to_channels(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    screenshot_data: &str,
+) {
+    use moltis_common::types::{MediaAttachment, ReplyPayload};
+
+    let targets = state.peek_channel_replies(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let outbound = match state.services.channel_outbound_arc() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let payload = ReplyPayload {
+        text: String::new(), // No caption, just the image
+        media: Some(MediaAttachment {
+            url: screenshot_data.to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+        reply_to_id: None,
+        silent: false,
+    };
+
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let payload = payload.clone();
+        tasks.push(tokio::spawn(async move {
+            match target.channel_type {
+                moltis_channels::ChannelType::Telegram => {
+                    if let Err(e) = outbound
+                        .send_media(&target.account_id, &target.chat_id, &payload)
+                        .await
+                    {
+                        warn!(
+                            account_id = target.account_id,
+                            chat_id = target.chat_id,
+                            "failed to send screenshot to channel: {e}"
+                        );
+                        // Notify the user of the error
+                        let error_msg = format!("⚠️ Failed to send screenshot: {e}");
+                        let _ = outbound
+                            .send_text(&target.account_id, &target.chat_id, &error_msg)
+                            .await;
+                    } else {
+                        debug!(
+                            account_id = target.account_id,
+                            chat_id = target.chat_id,
+                            "sent screenshot to telegram"
+                        );
+                    }
+                },
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel reply task join failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        anyhow::Result,
+        moltis_agents::tool_registry::AgentTool,
+        moltis_common::types::ReplyPayload,
+        std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::{Duration, Instant},
+        },
+    };
+
+    struct DummyTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl AgentTool for DummyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "test"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    struct MockChannelOutbound {
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl moltis_channels::plugin::ChannelOutbound for MockChannelOutbound {
+        async fn send_text(&self, _account_id: &str, _to: &str, _text: &str) -> Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn send_media(
+            &self,
+            _account_id: &str,
+            _to: &str,
+            _payload: &ReplyPayload,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_channel_replies_waits_for_outbound_sends() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let outbound: Arc<dyn moltis_channels::plugin::ChannelOutbound> =
+            Arc::new(MockChannelOutbound {
+                calls: Arc::clone(&calls),
+                delay: Duration::from_millis(50),
+            });
+        let targets = vec![moltis_channels::ChannelReplyTarget {
+            channel_type: moltis_channels::ChannelType::Telegram,
+            account_id: "acct".to_string(),
+            chat_id: "123".to_string(),
+        }];
+        let state = crate::state::GatewayState::new(
+            crate::auth::ResolvedAuth {
+                mode: crate::auth::AuthMode::Token,
+                token: None,
+                password: None,
+            },
+            crate::services::GatewayServices::noop(),
+            Arc::new(moltis_tools::approval::ApprovalManager::default()),
+        );
+
+        let start = Instant::now();
+        deliver_channel_replies_to_targets(
+            outbound,
+            targets,
+            "session:test",
+            "hello",
+            state,
+            ReplyMedium::Text,
+        )
+        .await;
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(45),
+            "delivery should wait for outbound send completion"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     /// Build a bare session_locks map for testing the semaphore logic
     /// without constructing a full LiveChatService.
@@ -2366,5 +3134,86 @@ mod tests {
 
         let collect: Wrapper = toml::from_str(r#"mode = "collect""#).unwrap();
         assert_eq!(collect.mode, MessageQueueMode::Collect);
+    }
+
+    #[test]
+    fn effective_tool_policy_profile_and_config_merge() {
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.profile = Some("full".into());
+        cfg.tools.policy.deny = vec!["exec".into()];
+
+        let policy = effective_tool_policy(&cfg);
+        assert!(!policy.is_allowed("exec"));
+        assert!(policy.is_allowed("web_fetch"));
+    }
+
+    #[test]
+    fn runtime_filters_apply_policy_without_skill_tool_restrictions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "exec".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "web_fetch".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "create_skill".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "session_state".to_string(),
+        }));
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.allow = vec!["exec".into(), "web_fetch".into(), "create_skill".into()];
+
+        let skills = vec![moltis_skills::types::SkillMetadata {
+            name: "my-skill".into(),
+            description: "test".into(),
+            license: None,
+            compatibility: None,
+            allowed_tools: vec!["Bash(git:*)".into()],
+            homepage: None,
+            dockerfile: None,
+            requires: Default::default(),
+            path: std::path::PathBuf::new(),
+            source: None,
+        }];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        assert!(filtered.get("exec").is_some());
+        assert!(filtered.get("web_fetch").is_some());
+        assert!(filtered.get("create_skill").is_some());
+        assert!(filtered.get("session_state").is_none());
+    }
+
+    #[test]
+    fn runtime_filters_do_not_hide_create_skill_when_skill_allows_only_web_fetch() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "create_skill".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "web_fetch".to_string(),
+        }));
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.policy.allow = vec!["create_skill".into(), "web_fetch".into()];
+
+        let skills = vec![moltis_skills::types::SkillMetadata {
+            name: "weather".into(),
+            description: "weather checker".into(),
+            license: None,
+            compatibility: None,
+            allowed_tools: vec!["WebFetch".into()],
+            homepage: None,
+            dockerfile: None,
+            requires: Default::default(),
+            path: std::path::PathBuf::new(),
+            source: None,
+        }];
+
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        assert!(filtered.get("create_skill").is_some());
+        assert!(filtered.get("web_fetch").is_some());
     }
 }

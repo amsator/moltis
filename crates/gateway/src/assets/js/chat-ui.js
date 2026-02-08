@@ -45,7 +45,16 @@ export function appendChannelFooter(el, channel) {
 	var label = channel.channel_type || "channel";
 	var who = channel.username ? `@${channel.username}` : channel.sender_name;
 	if (who) label += ` \u00b7 ${who}`;
-	ft.textContent = `via ${label}`;
+	if (channel.message_kind === "voice") {
+		var icon = document.createElement("span");
+		icon.className = "voice-icon";
+		icon.setAttribute("aria-hidden", "true");
+		ft.appendChild(icon);
+	}
+
+	var text = document.createElement("span");
+	text.textContent = `via ${label}`;
+	ft.appendChild(text);
 	el.appendChild(ft);
 }
 
@@ -244,6 +253,9 @@ export function updateTokenBar() {
 	if (S.sessionContextWindow > 0) {
 		var pct = Math.max(0, 100 - Math.round((total / S.sessionContextWindow) * 100));
 		text += ` \u00b7 Context left before auto-compact: ${pct}%`;
+	}
+	if (!S.sessionToolsEnabled) {
+		text += " \u00b7 Tools: disabled";
 	}
 	bar.textContent = text;
 }

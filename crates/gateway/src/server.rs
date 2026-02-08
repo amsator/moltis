@@ -25,7 +25,11 @@ use {moltis_channels::ChannelPlugin, moltis_protocol::TICK_INTERVAL_MS};
 
 use moltis_agents::providers::ProviderRegistry;
 
-use moltis_tools::{approval::ApprovalManager, exec::EnvVarProvider, image_cache::ImageBuilder};
+use moltis_tools::{
+    approval::{ApprovalManager, ApprovalMode, SecurityLevel},
+    exec::EnvVarProvider,
+    image_cache::ImageBuilder,
+};
 
 use {
     moltis_projects::ProjectStore,
@@ -46,6 +50,10 @@ use crate::{
     services::GatewayServices,
     session::LiveSessionService,
     state::GatewayState,
+    update_check::{
+        UPDATE_CHECK_INTERVAL, fetch_update_availability, github_latest_release_api_url,
+        resolve_repository_url,
+    },
     ws::handle_connection,
 };
 
@@ -64,6 +72,97 @@ pub struct TailscaleOpts {
     pub reset_on_exit: bool,
 }
 
+fn should_prebuild_sandbox_image(
+    mode: &moltis_tools::sandbox::SandboxMode,
+    packages: &[String],
+) -> bool {
+    !matches!(mode, moltis_tools::sandbox::SandboxMode::Off) && !packages.is_empty()
+}
+
+async fn ollama_has_model(base_url: &str, model: &str) -> bool {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let response = match reqwest::Client::new().get(url).send().await {
+        Ok(resp) => resp,
+        Err(_) => return false,
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let value: serde_json::Value = match response.json().await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    value
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|models| {
+            models.iter().any(|m| {
+                let name = m.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                name == model || name.starts_with(&format!("{model}:"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+async fn ensure_ollama_model(base_url: &str, model: &str) {
+    if ollama_has_model(base_url, model).await {
+        return;
+    }
+
+    warn!(
+        model = %model,
+        base_url = %base_url,
+        "memory: missing Ollama embedding model, attempting auto-pull"
+    );
+
+    let url = format!("{}/api/pull", base_url.trim_end_matches('/'));
+    let pull = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({ "name": model, "stream": false }))
+        .send()
+        .await;
+
+    match pull {
+        Ok(resp) if resp.status().is_success() => {
+            info!(model = %model, "memory: Ollama model pull complete");
+        },
+        Ok(resp) => {
+            warn!(
+                model = %model,
+                status = %resp.status(),
+                "memory: Ollama model pull failed"
+            );
+        },
+        Err(e) => {
+            warn!(model = %model, error = %e, "memory: Ollama model pull request failed");
+        },
+    }
+}
+
+fn approval_manager_from_config(config: &moltis_config::MoltisConfig) -> ApprovalManager {
+    let mut manager = ApprovalManager::default();
+
+    manager.mode = ApprovalMode::parse(&config.tools.exec.approval_mode).unwrap_or_else(|| {
+        warn!(
+            value = %config.tools.exec.approval_mode,
+            "invalid tools.exec.approval_mode; falling back to 'on-miss'"
+        );
+        ApprovalMode::OnMiss
+    });
+
+    manager.security_level = SecurityLevel::parse(&config.tools.exec.security_level)
+        .unwrap_or_else(|| {
+            warn!(
+                value = %config.tools.exec.security_level,
+                "invalid tools.exec.security_level; falling back to 'allowlist'"
+            );
+            SecurityLevel::Allowlist
+        });
+
+    manager.allowlist = config.tools.exec.allowlist.clone();
+    manager
+}
+
 // ── Shared app state ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -75,6 +174,103 @@ pub struct AppState {
 }
 
 // ── Server startup ───────────────────────────────────────────────────────────
+
+/// Build the protected API routes (shared between both build_gateway_app versions).
+#[cfg(feature = "web-ui")]
+fn build_protected_api_routes() -> Router<AppState> {
+    let protected = Router::new()
+        .route("/api/bootstrap", get(api_bootstrap_handler))
+        .route("/api/gon", get(api_gon_handler))
+        .route("/api/skills", get(api_skills_handler))
+        .route("/api/skills/search", get(api_skills_search_handler))
+        .route("/api/mcp", get(api_mcp_handler))
+        .route("/api/hooks", get(api_hooks_handler))
+        .route(
+            "/api/images/cached",
+            get(api_cached_images_handler).delete(api_prune_cached_images_handler),
+        )
+        .route(
+            "/api/images/cached/{tag}",
+            axum::routing::delete(api_delete_cached_image_handler),
+        )
+        .route(
+            "/api/images/build",
+            axum::routing::post(api_build_image_handler),
+        )
+        .route(
+            "/api/images/check-packages",
+            axum::routing::post(api_check_packages_handler),
+        )
+        .route(
+            "/api/images/default",
+            get(api_get_default_image_handler).put(api_set_default_image_handler),
+        )
+        .route(
+            "/api/env",
+            get(crate::env_routes::env_list).post(crate::env_routes::env_set),
+        )
+        .route(
+            "/api/env/{id}",
+            axum::routing::delete(crate::env_routes::env_delete),
+        )
+        // Config editor routes (sensitive - requires auth)
+        .route(
+            "/api/config",
+            get(crate::tools_routes::config_get).post(crate::tools_routes::config_save),
+        )
+        .route(
+            "/api/config/validate",
+            axum::routing::post(crate::tools_routes::config_validate),
+        )
+        .route(
+            "/api/config/template",
+            get(crate::tools_routes::config_template),
+        )
+        .route(
+            "/api/restart",
+            axum::routing::post(crate::tools_routes::restart),
+        );
+
+    // Add metrics API routes (protected).
+    #[cfg(feature = "metrics")]
+    let protected = protected
+        .route(
+            "/api/metrics",
+            get(crate::metrics_routes::api_metrics_handler),
+        )
+        .route(
+            "/api/metrics/summary",
+            get(crate::metrics_routes::api_metrics_summary_handler),
+        )
+        .route(
+            "/api/metrics/history",
+            get(crate::metrics_routes::api_metrics_history_handler),
+        );
+
+    protected
+}
+
+/// Apply auth middleware and feature-specific routes to protected API routes.
+#[cfg(feature = "web-ui")]
+fn finalize_protected_routes(protected: Router<AppState>, app_state: AppState) -> Router<AppState> {
+    let protected = protected.layer(axum::middleware::from_fn_with_state(
+        app_state,
+        crate::auth_middleware::require_auth,
+    ));
+
+    // Mount tailscale routes (protected) when the feature is enabled.
+    #[cfg(feature = "tailscale")]
+    let protected = protected.nest(
+        "/api/tailscale",
+        crate::tailscale_routes::tailscale_router(),
+    );
+
+    // Mount push notification routes when the feature is enabled.
+    #[cfg(feature = "push-notifications")]
+    let protected = protected.nest("/api/push", crate::push_routes::push_router());
+
+    protected
+}
 
 /// Build the gateway router (shared between production startup and tests).
 #[cfg(feature = "push-notifications")]
@@ -105,72 +301,17 @@ pub fn build_gateway_app(
     let app_state = AppState {
         gateway: state,
         methods,
-        #[cfg(feature = "push-notifications")]
         push_service,
     };
 
     #[cfg(feature = "web-ui")]
     let router = {
-        // Protected API routes — require auth when credential store is configured.
-        let mut protected = Router::new()
-            .route("/api/bootstrap", get(api_bootstrap_handler))
-            .route("/api/gon", get(api_gon_handler))
-            .route("/api/skills", get(api_skills_handler))
-            .route("/api/skills/search", get(api_skills_search_handler))
-            .route("/api/mcp", get(api_mcp_handler))
-            .route("/api/hooks", get(api_hooks_handler))
-            .route("/api/plugins", get(api_plugins_handler))
-            .route("/api/plugins/search", get(api_plugins_search_handler))
-            .route(
-                "/api/images/cached",
-                get(api_cached_images_handler).delete(api_prune_cached_images_handler),
-            )
-            .route(
-                "/api/images/cached/{tag}",
-                axum::routing::delete(api_delete_cached_image_handler),
-            )
-            .route(
-                "/api/images/build",
-                axum::routing::post(api_build_image_handler),
-            )
-            .route(
-                "/api/images/check-packages",
-                axum::routing::post(api_check_packages_handler),
-            )
-            .route(
-                "/api/images/default",
-                get(api_get_default_image_handler).put(api_set_default_image_handler),
-            )
-            .route(
-                "/api/env",
-                get(crate::env_routes::env_list).post(crate::env_routes::env_set),
-            )
-            .route(
-                "/api/env/{id}",
-                axum::routing::delete(crate::env_routes::env_delete),
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                app_state.clone(),
-                crate::auth_middleware::require_auth,
-            ));
-
-        // Mount tailscale routes (protected) when the feature is enabled.
-        #[cfg(feature = "tailscale")]
-        {
-            protected = protected.nest(
-                "/api/tailscale",
-                crate::tailscale_routes::tailscale_router(),
-            );
-        }
-
-        // Mount push notification routes when the feature is enabled.
-        #[cfg(feature = "push-notifications")]
-        {
-            protected = protected.nest("/api/push", crate::push_routes::push_router());
-        }
+        let protected = build_protected_api_routes();
+        let protected = finalize_protected_routes(protected, app_state.clone());
 
         // Public routes (assets, PWA files, SPA fallback).
         router
+            .route("/auth/callback", get(oauth_callback_handler))
             .route("/assets/v/{version}/{*path}", get(versioned_asset_handler))
             .route("/assets/{*path}", get(asset_handler))
             .route("/manifest.json", get(manifest_handler))
@@ -220,75 +361,12 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
 
     #[cfg(feature = "web-ui")]
     let router = {
-        // Protected API routes — require auth when credential store is configured.
-        let protected = Router::new()
-            .route("/api/bootstrap", get(api_bootstrap_handler))
-            .route("/api/gon", get(api_gon_handler))
-            .route("/api/skills", get(api_skills_handler))
-            .route("/api/skills/search", get(api_skills_search_handler))
-            .route("/api/mcp", get(api_mcp_handler))
-            .route("/api/hooks", get(api_hooks_handler))
-            .route("/api/plugins", get(api_plugins_handler))
-            .route("/api/plugins/search", get(api_plugins_search_handler))
-            .route(
-                "/api/images/cached",
-                get(api_cached_images_handler).delete(api_prune_cached_images_handler),
-            )
-            .route(
-                "/api/images/cached/{tag}",
-                axum::routing::delete(api_delete_cached_image_handler),
-            )
-            .route(
-                "/api/images/build",
-                axum::routing::post(api_build_image_handler),
-            )
-            .route(
-                "/api/images/check-packages",
-                axum::routing::post(api_check_packages_handler),
-            )
-            .route(
-                "/api/images/default",
-                get(api_get_default_image_handler).put(api_set_default_image_handler),
-            )
-            .route(
-                "/api/env",
-                get(crate::env_routes::env_list).post(crate::env_routes::env_set),
-            )
-            .route(
-                "/api/env/{id}",
-                axum::routing::delete(crate::env_routes::env_delete),
-            );
-
-        // Add metrics API routes (protected).
-        #[cfg(feature = "metrics")]
-        let protected = protected
-            .route(
-                "/api/metrics",
-                get(crate::metrics_routes::api_metrics_handler),
-            )
-            .route(
-                "/api/metrics/summary",
-                get(crate::metrics_routes::api_metrics_summary_handler),
-            )
-            .route(
-                "/api/metrics/history",
-                get(crate::metrics_routes::api_metrics_history_handler),
-            );
-
-        let protected = protected.layer(axum::middleware::from_fn_with_state(
-            app_state.clone(),
-            crate::auth_middleware::require_auth,
-        ));
-
-        // Mount tailscale routes (protected) when the feature is enabled.
-        #[cfg(feature = "tailscale")]
-        let protected = protected.nest(
-            "/api/tailscale",
-            crate::tailscale_routes::tailscale_router(),
-        );
+        let protected = build_protected_api_routes();
+        let protected = finalize_protected_routes(protected, app_state.clone());
 
         // Public routes (assets, PWA files, SPA fallback).
         router
+            .route("/auth/callback", get(oauth_callback_handler))
             .route("/assets/v/{version}/{*path}", get(versioned_asset_handler))
             .route("/assets/{*path}", get(asset_handler))
             .route("/manifest.json", get(manifest_handler))
@@ -346,8 +424,8 @@ pub async fn start_gateway(
     ));
     let provider_summary = registry.read().await.provider_summary();
 
-    // Create shared approval manager.
-    let approval_manager = Arc::new(ApprovalManager::default());
+    // Create shared approval manager from config.
+    let approval_manager = Arc::new(approval_manager_from_config(&config));
 
     let mut services = GatewayServices::noop();
 
@@ -357,6 +435,11 @@ pub async fn start_gateway(
     }
 
     services.exec_approval = Arc::new(LiveExecApprovalService::new(Arc::clone(&approval_manager)));
+
+    // Wire browser service if enabled.
+    if let Some(browser_svc) = crate::services::RealBrowserService::from_config(&config) {
+        services.browser = Arc::new(browser_svc);
+    }
 
     // Wire live onboarding service.
     let onboarding_config_path = moltis_config::find_or_default_config_path();
@@ -383,6 +466,17 @@ pub async fn start_gateway(
     };
     // When local-llm feature is disabled, this variable is not needed since
     // the only usage is also feature-gated.
+
+    // Wire live voice services when the feature is enabled.
+    #[cfg(feature = "voice")]
+    {
+        use crate::voice::{LiveSttService, LiveTtsService, SttServiceConfig};
+
+        // Services read fresh config from disk on each operation,
+        // so we just need to create the instances here.
+        services.tts = Arc::new(LiveTtsService::new(moltis_voice::TtsConfig::default()));
+        services.stt = Arc::new(LiveSttService::new(SttServiceConfig::default()));
+    }
 
     if !registry.read().await.is_empty() {
         services = services.with_model(Arc::new(LiveModelService::new(Arc::clone(&registry))));
@@ -435,7 +529,21 @@ pub async fn start_gateway(
 
     // Initialize data directory and SQLite database.
     let data_dir = data_dir.unwrap_or_else(moltis_config::data_dir);
-    std::fs::create_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed to create data directory {}: {e}",
+            data_dir.display()
+        )
+    });
+
+    let config_dir =
+        moltis_config::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".moltis"));
+    std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
+        panic!(
+            "failed to create config directory {}: {e}",
+            config_dir.display()
+        )
+    });
 
     // Enable log persistence so entries survive restarts.
     if let Some(ref buf) = log_buffer {
@@ -462,6 +570,9 @@ pub async fn start_gateway(
     crate::run_migrations(&db_pool)
         .await
         .expect("failed to run gateway migrations");
+
+    // Migrate plugins data into unified skills system (idempotent, non-fatal).
+    moltis_skills::migration::migrate_plugins_to_skills(&data_dir).await;
 
     // Initialize credential store (auth tables).
     let credential_store = Arc::new(
@@ -609,6 +720,36 @@ pub async fn start_gateway(
             let state = st
                 .get()
                 .ok_or_else(|| anyhow::anyhow!("gateway not ready"))?;
+
+            // OpenClaw-style cost guard: if HEARTBEAT.md exists but is effectively
+            // empty (comments/blank scaffold) and there's no explicit
+            // heartbeat.prompt override, skip the LLM turn entirely.
+            let is_heartbeat_turn = matches!(
+                &req.session_target,
+                moltis_cron::types::SessionTarget::Named(name) if name == "heartbeat"
+            );
+            if is_heartbeat_turn {
+                let hb_cfg = state.heartbeat_config.read().await.clone();
+                let has_prompt_override = hb_cfg
+                    .prompt
+                    .as_deref()
+                    .is_some_and(|p| !p.trim().is_empty());
+                let heartbeat_path = moltis_config::heartbeat_path();
+                let heartbeat_file_exists = heartbeat_path.exists();
+                let heartbeat_md = moltis_config::load_heartbeat_md();
+                if heartbeat_file_exists && heartbeat_md.is_none() && !has_prompt_override {
+                    tracing::info!(
+                        path = %heartbeat_path.display(),
+                        "skipping heartbeat LLM turn: HEARTBEAT.md is empty"
+                    );
+                    return Ok(moltis_cron::service::AgentTurnResult {
+                        output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                }
+            }
+
             let chat = state.chat().await;
             let session_key = match &req.session_target {
                 moltis_cron::types::SessionTarget::Named(name) => {
@@ -738,7 +879,7 @@ pub async fn start_gateway(
             .clone()
             .unwrap_or_else(|| moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE.to_string());
 
-        if !packages.is_empty() {
+        if should_prebuild_sandbox_image(router.mode(), &packages) {
             let deferred_for_build = Arc::clone(&deferred_state);
             tokio::spawn(async move {
                 // Broadcast build start event.
@@ -807,6 +948,77 @@ pub async fn start_gateway(
                 }
             });
         }
+    }
+
+    // Pre-pull browser container image if browser is enabled and sandbox mode is available.
+    // Browser sandbox mode follows session sandbox mode, so we pre-pull if sandboxing is available.
+    // Don't pre-pull if sandbox is disabled (mode = Off).
+    if config.tools.browser.enabled
+        && !matches!(
+            sandbox_router.config().mode,
+            moltis_tools::sandbox::SandboxMode::Off
+        )
+    {
+        let sandbox_image = config.tools.browser.sandbox_image.clone();
+        let deferred_for_browser = Arc::clone(&deferred_state);
+        tokio::spawn(async move {
+            // Broadcast pull start event.
+            if let Some(state) = deferred_for_browser.get() {
+                crate::broadcast::broadcast(
+                    state,
+                    "browser.image.pull",
+                    serde_json::json!({
+                        "phase": "start",
+                        "image": sandbox_image,
+                    }),
+                    crate::broadcast::BroadcastOpts {
+                        drop_if_slow: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            }
+
+            match moltis_browser::container::ensure_image(&sandbox_image) {
+                Ok(()) => {
+                    info!(image = %sandbox_image, "browser container image ready");
+                    if let Some(state) = deferred_for_browser.get() {
+                        crate::broadcast::broadcast(
+                            state,
+                            "browser.image.pull",
+                            serde_json::json!({
+                                "phase": "done",
+                                "image": sandbox_image,
+                            }),
+                            crate::broadcast::BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(image = %sandbox_image, error = %e, "browser container image pull failed");
+                    if let Some(state) = deferred_for_browser.get() {
+                        crate::broadcast::broadcast(
+                            state,
+                            "browser.image.pull",
+                            serde_json::json!({
+                                "phase": "error",
+                                "image": sandbox_image,
+                                "error": e.to_string(),
+                            }),
+                            crate::broadcast::BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+                },
+            }
+        });
     }
 
     // Load any persisted sandbox overrides from session metadata.
@@ -935,6 +1147,8 @@ pub async fn start_gateway(
     };
 
     // ── Hook discovery & registration ─────────────────────────────────────
+    seed_default_workspace_markdown_files();
+    seed_example_skill();
     seed_example_hook();
     let persisted_disabled = crate::methods::load_disabled_hooks();
     let (hook_registry, discovered_hooks_info) =
@@ -1006,6 +1220,10 @@ pub async fn start_gateway(
                             "ollama" => "http://localhost:11434".into(),
                             _ => "https://api.openai.com".into(),
                         });
+                    if provider_name == "ollama" {
+                        let model = mem_cfg.model.as_deref().unwrap_or("nomic-embed-text");
+                        ensure_ollama_model(&base_url, model).await;
+                    }
                     let api_key = mem_cfg
                         .api_key
                         .as_ref()
@@ -1036,6 +1254,7 @@ pub async fn start_gateway(
                 .await
                 .is_ok();
             if ollama_ok {
+                ensure_ollama_model("http://localhost:11434", "nomic-embed-text").await;
                 let e =
                     moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(String::new())
                         .with_base_url("http://localhost:11434".into())
@@ -1116,19 +1335,29 @@ pub async fn start_gateway(
                 } else {
                     // Scan the data directory for memory files written by the
                     // silent memory turn (MEMORY.md, memory/*.md).
-                    let data_memory_root = data_dir.clone();
+                    let data_memory_file = data_dir.join("MEMORY.md");
+                    let data_memory_file_lower = data_dir.join("memory.md");
                     let data_memory_sub = data_dir.join("memory");
 
                     let config = moltis_memory::config::MemoryConfig {
                         db_path: memory_db_path.to_string_lossy().into(),
-                        memory_dirs: vec![data_memory_root, data_memory_sub],
+                        memory_dirs: vec![
+                            data_memory_file,
+                            data_memory_file_lower,
+                            data_memory_sub,
+                        ],
                         ..Default::default()
                     };
 
                     let store = Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(
                         memory_pool,
                     ));
-                    let watch_dirs = config.memory_dirs.clone();
+                    let watch_dirs: Vec<_> = config
+                        .memory_dirs
+                        .iter()
+                        .filter(|p| p.is_dir())
+                        .cloned()
+                        .collect();
                     let manager = Arc::new(if let Some(embedder) = embedder {
                         moltis_memory::manager::MemoryManager::new(config, store, embedder)
                     } else {
@@ -1380,6 +1609,9 @@ pub async fn start_gateway(
         {
             tool_registry.register(Box::new(t));
         }
+        if let Some(t) = moltis_tools::browser::BrowserTool::from_config(&config.tools.browser) {
+            tool_registry.register(Box::new(t));
+        }
 
         // Register memory tools if the memory system is available.
         if let Some(ref mm) = memory_manager {
@@ -1396,9 +1628,16 @@ pub async fn start_gateway(
             moltis_tools::session_state::SessionStateTool::new(Arc::clone(&session_state_store)),
         ));
 
+        // Register built-in voice tools for explicit TTS/STT calls in agents.
+        tool_registry.register(Box::new(crate::voice_agent_tools::SpeakTool::new(
+            Arc::clone(&state.services.tts),
+        )));
+        tool_registry.register(Box::new(crate::voice_agent_tools::TranscribeTool::new(
+            Arc::clone(&state.services.stt),
+        )));
+
         // Register skill management tools for agent self-extension.
-        // Use data_dir so created skills land in ~/.moltis/skills/ (Personal
-        // source), which is always discovered regardless of the gateway's cwd.
+        // Use data_dir so created skills land in the configured workspace root.
         {
             tool_registry.register(Box::new(moltis_tools::skill_tools::CreateSkillTool::new(
                 data_dir.clone(),
@@ -1489,13 +1728,17 @@ pub async fn start_gateway(
             .set_tool_registry(Arc::clone(&shared_tool_registry))
             .await;
         crate::mcp_service::sync_mcp_tools(live_mcp.manager(), &shared_tool_registry).await;
+
+        // Log registered tools for debugging.
+        let schemas = shared_tool_registry.read().await.list_schemas();
+        let tool_names: Vec<&str> = schemas.iter().filter_map(|s| s["name"].as_str()).collect();
+        info!(tools = ?tool_names, "agent tools registered");
     }
 
     // Spawn skill file watcher for hot-reload.
     #[cfg(feature = "file-watcher")]
     {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
+        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
         let watch_dirs: Vec<std::path::PathBuf> =
             search_paths.into_iter().map(|(p, _)| p).collect();
         if let Ok((_watcher, mut rx)) = moltis_skills::watcher::SkillWatcher::start(watch_dirs) {
@@ -1618,8 +1861,7 @@ pub async fn start_gateway(
     // Count enabled skills and repos for startup banner.
     let (skill_count, repo_count) = {
         use moltis_skills::discover::{FsSkillDiscoverer, SkillDiscoverer};
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let discoverer = FsSkillDiscoverer::new(FsSkillDiscoverer::default_paths(&cwd));
+        let discoverer = FsSkillDiscoverer::new(FsSkillDiscoverer::default_paths());
         let sc = discoverer.discover().await.map(|s| s.len()).unwrap_or(0);
         let rc = moltis_skills::manifest::ManifestStore::default_path()
             .ok()
@@ -1807,6 +2049,68 @@ pub async fn start_gateway(
                 v => v,
             };
             broadcast_tick(&tick_state, process_mem, available, total).await;
+        }
+    });
+
+    // Spawn periodic update check against latest GitHub release.
+    let update_state = Arc::clone(&state);
+    let update_repository_url =
+        resolve_repository_url(config.server.update_repository_url.as_deref());
+    tokio::spawn(async move {
+        let latest_release_api_url = match update_repository_url {
+            Some(repository_url) => match github_latest_release_api_url(&repository_url) {
+                Ok(url) => url,
+                Err(e) => {
+                    warn!("update checker disabled: {e}");
+                    return;
+                },
+            },
+            None => {
+                info!("update checker disabled: server.update_repository_url is not configured");
+                return;
+            },
+        };
+
+        let client = match reqwest::Client::builder()
+            .user_agent(format!("moltis-gateway/{}", update_state.version))
+            .timeout(std::time::Duration::from_secs(12))
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                warn!("failed to initialize update checker HTTP client: {e}");
+                return;
+            },
+        };
+
+        let mut interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            match fetch_update_availability(&client, &latest_release_api_url, &update_state.version)
+                .await
+            {
+                Ok(next) => {
+                    let changed = {
+                        let mut update = update_state.update.write().await;
+                        if *update == next {
+                            false
+                        } else {
+                            *update = next.clone();
+                            true
+                        }
+                    };
+                    if changed && let Ok(payload) = serde_json::to_value(&next) {
+                        broadcast(&update_state, "update.available", payload, BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        })
+                        .await;
+                    }
+                },
+                Err(e) => {
+                    warn!("failed to check latest release: {e}");
+                },
+            }
         }
     });
 
@@ -2034,14 +2338,32 @@ pub async fn start_gateway(
     // Use a fixed ID so run history persists across restarts.
     {
         use moltis_cron::{
-            heartbeat::{DEFAULT_INTERVAL_MS, parse_interval_ms, resolve_heartbeat_prompt},
+            heartbeat::{
+                DEFAULT_INTERVAL_MS, HeartbeatPromptSource, parse_interval_ms,
+                resolve_heartbeat_prompt,
+            },
             types::{CronJobCreate, CronJobPatch, CronPayload, CronSchedule, SessionTarget},
         };
         const HEARTBEAT_JOB_ID: &str = "__heartbeat__";
 
         let hb = &config.heartbeat;
         let interval_ms = parse_interval_ms(&hb.every).unwrap_or(DEFAULT_INTERVAL_MS);
-        let prompt = resolve_heartbeat_prompt(hb.prompt.as_deref());
+        let heartbeat_md = moltis_config::load_heartbeat_md();
+        let (prompt, prompt_source) =
+            resolve_heartbeat_prompt(hb.prompt.as_deref(), heartbeat_md.as_deref());
+        if prompt_source == HeartbeatPromptSource::HeartbeatMd {
+            tracing::info!("loaded heartbeat prompt from HEARTBEAT.md");
+        }
+        if hb.prompt.as_deref().is_some_and(|p| !p.trim().is_empty())
+            && heartbeat_md
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            && prompt_source == HeartbeatPromptSource::Config
+        {
+            tracing::warn!(
+                "heartbeat prompt source conflict: config heartbeat.prompt overrides HEARTBEAT.md"
+            );
+        }
 
         // Check if heartbeat job already exists.
         let existing = cron_service.list().await;
@@ -2330,6 +2652,7 @@ struct GonData {
     cron_status: moltis_cron::types::CronStatus,
     heartbeat_config: moltis_config::schema::HeartbeatConfig,
     heartbeat_runs: Vec<moltis_cron::types::CronRunRecord>,
+    voice_enabled: bool,
     /// Non-main git branch name, if running from a git checkout on a
     /// non-default branch. `None` when on `main`/`master` or outside a repo.
     git_branch: Option<String>,
@@ -2338,6 +2661,8 @@ struct GonData {
     /// Cloud deploy platform (e.g. "flyio"), `None` when running locally.
     #[serde(skip_serializing_if = "Option::is_none")]
     deploy_platform: Option<String>,
+    /// Availability of newer GitHub release for this running version.
+    update: crate::update_check::UpdateAvailability,
 }
 
 /// Memory snapshot included in gon data and tick broadcasts.
@@ -2380,27 +2705,21 @@ fn collect_mem_snapshot() -> MemSnapshot {
 }
 
 /// Detect the current git branch, returning `None` for `main`/`master` or
-/// when not inside a git repository. The result is cached in a `OnceLock` so
-/// the `git` subprocess runs at most once per process.
+/// when not inside a git repository. The result is cached in a `OnceLock`.
 #[cfg(feature = "web-ui")]
 fn detect_git_branch() -> Option<String> {
     static BRANCH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     BRANCH
         .get_or_init(|| {
-            let output = std::process::Command::new("git")
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let raw = String::from_utf8(output.stdout).ok()?;
-            parse_git_branch(&raw)
+            let repo = gix::discover(".").ok()?;
+            let head = repo.head().ok()?;
+            let branch = head.referent_name()?.shorten().to_string();
+            parse_git_branch(&branch)
         })
         .clone()
 }
 
-/// Parse the raw output of `git rev-parse --abbrev-ref HEAD`, returning
+/// Parse a branch name, returning
 /// `None` for default branches (`main`/`master`) or empty/blank output.
 #[cfg(feature = "web-ui")]
 fn parse_git_branch(raw: &str) -> Option<String> {
@@ -2426,7 +2745,6 @@ struct NavCounts {
     projects: usize,
     providers: usize,
     channels: usize,
-    plugins: usize,
     skills: usize,
     mcp: usize,
     crons: usize,
@@ -2492,9 +2810,11 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
         cron_status,
         heartbeat_config,
         heartbeat_runs,
+        voice_enabled: cfg!(feature = "voice"),
         git_branch: detect_git_branch(),
         mem: collect_mem_snapshot(),
         deploy_platform: gw.deploy_platform.clone(),
+        update: gw.update.read().await.clone(),
     }
 }
 
@@ -2551,20 +2871,6 @@ async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
         }
     }
 
-    // Count enabled plugins from plugins manifest.
-    let mut plugins = 0usize;
-    if let Ok(path) = moltis_plugins::install::default_manifest_path() {
-        let store = moltis_skills::manifest::ManifestStore::new(path);
-        if let Ok(m) = store.load() {
-            plugins = m
-                .repos
-                .iter()
-                .flat_map(|r| &r.skills)
-                .filter(|s| s.enabled)
-                .count();
-        }
-    }
-
     let mcp = mcp
         .ok()
         .and_then(|v| {
@@ -2598,7 +2904,6 @@ async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
         projects,
         providers,
         channels,
-        plugins,
         skills,
         mcp,
         crons,
@@ -2609,6 +2914,52 @@ async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
 #[cfg(feature = "web-ui")]
 async fn api_gon_handler(State(state): State<AppState>) -> impl IntoResponse {
     Json(build_gon_data(&state.gateway).await)
+}
+
+#[cfg(feature = "web-ui")]
+async fn oauth_callback_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(code) = params.get("code") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Authentication failed</h1><p>Missing authorization code.</p>".to_string()),
+        )
+            .into_response();
+    };
+    let Some(oauth_state) = params.get("state") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<h1>Authentication failed</h1><p>Missing OAuth state.</p>".to_string()),
+        )
+            .into_response();
+    };
+
+    match state
+        .gateway
+        .services
+        .provider_setup
+        .oauth_complete(serde_json::json!({
+            "code": code,
+            "state": oauth_state,
+        }))
+        .await
+    {
+        Ok(_) => Html(
+            "<h1>Authentication successful!</h1><p>You can close this window.</p><script>window.close();</script>"
+                .to_string(),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "OAuth callback completion failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Html("<h1>Authentication failed</h1><p>Could not complete OAuth flow.</p>".to_string()),
+            )
+                .into_response()
+        },
+    }
 }
 
 #[cfg(feature = "web-ui")]
@@ -2837,11 +3188,8 @@ async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse 
                 data_dir.join("skills"),
                 moltis_skills::types::SkillSource::Personal,
             ),
-            // Project-local skills if gateway was started from a project directory.
             (
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(".moltis/skills"),
+                data_dir.join(".moltis/skills"),
                 moltis_skills::types::SkillSource::Project,
             ),
         ];
@@ -2857,24 +3205,6 @@ async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse 
             }
         }
     }
-
-    Json(serde_json::json!({ "skills": skills, "repos": repos }))
-}
-
-/// Plugins endpoint: repos and enabled skills from the plugins manifest only.
-#[cfg(feature = "web-ui")]
-async fn api_plugins_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let repos = state
-        .gateway
-        .services
-        .plugins
-        .repos_list()
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
-    let skills = enabled_from_manifest(moltis_plugins::install::default_manifest_path());
 
     Json(serde_json::json!({ "skills": skills, "repos": repos }))
 }
@@ -2936,25 +3266,6 @@ async fn api_skills_search_handler(
         .gateway
         .services
         .skills
-        .repos_list_full()
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    api_search_handler(repos, &source, &query).await
-}
-
-#[cfg(feature = "web-ui")]
-async fn api_plugins_search_handler(
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let source = params.get("source").cloned().unwrap_or_default();
-    let query = params.get("q").cloned().unwrap_or_default();
-    let repos = state
-        .gateway
-        .services
-        .plugins
         .repos_list_full()
         .await
         .ok()
@@ -3336,15 +3647,31 @@ async fn service_worker_handler() -> impl IntoResponse {
 #[cfg(feature = "web-ui")]
 fn serve_asset(path: &str, cache_control: &'static str) -> axum::response::Response {
     match read_asset(path) {
-        Some(body) => (
-            StatusCode::OK,
-            [
-                ("content-type", mime_for_path(path)),
-                ("cache-control", cache_control),
-            ],
-            body,
-        )
-            .into_response(),
+        Some(body) => {
+            let mut response = (
+                StatusCode::OK,
+                [
+                    ("content-type", mime_for_path(path)),
+                    ("cache-control", cache_control),
+                    ("x-content-type-options", "nosniff"),
+                ],
+                body,
+            )
+                .into_response();
+
+            // Harden SVG delivery against script execution when user-controlled
+            // SVGs are ever introduced. Static first-party SVGs continue to render.
+            if path.rsplit('.').next().unwrap_or("") == "svg" {
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    axum::http::HeaderValue::from_static(
+                        "default-src 'none'; img-src 'self' data:; style-src 'none'; script-src 'none'; object-src 'none'; frame-ancestors 'none'",
+                    ),
+                );
+            }
+
+            response
+        },
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -3398,6 +3725,43 @@ fn seed_example_hook() {
     }
     if let Err(e) = std::fs::write(&hook_md, EXAMPLE_HOOK_MD) {
         tracing::debug!("could not write example HOOK.md: {e}");
+    }
+}
+
+/// Seed a starter personal skill into `~/.moltis/skills/template-skill/`.
+///
+/// This is a safe template to help users author their own SKILL.md. Existing
+/// user content is never overwritten.
+fn seed_example_skill() {
+    let skill_dir = moltis_config::data_dir().join("skills/template-skill");
+    let skill_md = skill_dir.join("SKILL.md");
+    if skill_md.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        tracing::debug!("could not create template skill dir: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(&skill_md, EXAMPLE_SKILL_MD) {
+        tracing::debug!("could not write template SKILL.md: {e}");
+    }
+}
+
+/// Seed default workspace markdown files in workspace root on first run.
+fn seed_default_workspace_markdown_files() {
+    let data_dir = moltis_config::data_dir();
+    seed_file_if_missing(data_dir.join("BOOT.md"), DEFAULT_BOOT_MD);
+    seed_file_if_missing(data_dir.join("AGENTS.md"), DEFAULT_WORKSPACE_AGENTS_MD);
+    seed_file_if_missing(data_dir.join("TOOLS.md"), DEFAULT_TOOLS_MD);
+    seed_file_if_missing(data_dir.join("HEARTBEAT.md"), DEFAULT_HEARTBEAT_MD);
+}
+
+fn seed_file_if_missing(path: std::path::PathBuf, content: &str) {
+    if path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, content) {
+        tracing::debug!(path = %path.display(), "could not write default markdown file: {e}");
     }
 }
 
@@ -3486,6 +3850,81 @@ env = ["MY_API_KEY"]        # required environment variables
 ```
 "#;
 
+/// Content for the starter example personal skill.
+const EXAMPLE_SKILL_MD: &str = r#"---
+name: template-skill
+description: Starter skill template (safe to copy and edit)
+---
+
+# Template Skill
+
+Use this as a starting point for your own skills.
+
+## How to use
+
+1. Copy this folder to a new skill name (or edit in place)
+2. Update `name` and `description` in frontmatter
+3. Replace this body with clear, specific instructions
+
+## Tips
+
+- Keep instructions explicit and task-focused
+- Avoid broad permissions unless required
+- Document required tools and expected inputs
+"#;
+
+/// Default BOOT.md content seeded into workspace root.
+const DEFAULT_BOOT_MD: &str = r#"<!--
+BOOT.md is optional startup context.
+
+How Moltis uses this file:
+- Read on every GatewayStart by the built-in boot-md hook.
+- Missing/empty/comment-only file = no startup injection.
+- Non-empty content = injected as startup user message context.
+
+Recommended usage:
+- Keep it short and explicit.
+- Use for startup checks/reminders, not onboarding identity setup.
+-->"#;
+
+/// Default workspace AGENTS.md content seeded into workspace root.
+const DEFAULT_WORKSPACE_AGENTS_MD: &str = r#"<!--
+Workspace AGENTS.md contains global instructions for this workspace.
+
+How Moltis uses this file:
+- Loaded from data_dir/AGENTS.md when present.
+- Injected as workspace context in the system prompt.
+- Separate from project AGENTS.md/CLAUDE.md discovery.
+
+Use this for cross-project rules that should apply everywhere in this workspace.
+-->"#;
+
+/// Default TOOLS.md content seeded into workspace root.
+const DEFAULT_TOOLS_MD: &str = r#"<!--
+TOOLS.md contains workspace-specific tool notes and constraints.
+
+How Moltis uses this file:
+- Loaded from data_dir/TOOLS.md when present.
+- Injected as workspace context in the system prompt.
+
+Use this for local setup details (hosts, aliases, device names) and
+tool behavior constraints (safe defaults, forbidden actions, etc.).
+-->"#;
+
+/// Default HEARTBEAT.md content seeded into workspace root.
+const DEFAULT_HEARTBEAT_MD: &str = r#"<!--
+HEARTBEAT.md is an optional heartbeat prompt source.
+
+Prompt precedence:
+1) heartbeat.prompt from config
+2) HEARTBEAT.md
+3) built-in default prompt
+
+Cost guard:
+- If HEARTBEAT.md exists but is empty/comment-only and there is no explicit
+  heartbeat.prompt override, Moltis skips heartbeat LLM turns to avoid token use.
+-->"#;
+
 /// Discover hooks from the filesystem, check eligibility, and build a
 /// [`HookRegistry`] plus a `Vec<DiscoveredHookInfo>` for the web UI.
 ///
@@ -3508,8 +3947,7 @@ pub(crate) async fn discover_and_build_hooks(
         shell_hook::ShellHookHandler,
     };
 
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let discoverer = FsHookDiscoverer::new(FsHookDiscoverer::default_paths(&cwd));
+    let discoverer = FsHookDiscoverer::new(FsHookDiscoverer::default_paths());
     let discovered = discoverer.discover().await.unwrap_or_default();
 
     let mut registry = moltis_common::hooks::HookRegistry::new();
@@ -3579,11 +4017,10 @@ pub(crate) async fn discover_and_build_hooks(
 
     // ── Built-in hooks (compiled Rust, always active) ──────────────────
     {
-        let cwd = std::env::current_dir().unwrap_or_default();
         let data = moltis_config::data_dir();
 
         // boot-md: inject BOOT.md content on GatewayStart.
-        let boot = BootMdHook::new(cwd.clone());
+        let boot = BootMdHook::new(data.clone());
         registry.register(Arc::new(boot));
 
         // command-logger: append JSONL entries for every slash command.
@@ -3641,7 +4078,111 @@ pub(crate) async fn discover_and_build_hooks(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, std::collections::HashSet};
+
+    #[test]
+    fn approval_manager_uses_config_values() {
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.exec.approval_mode = "always".into();
+        cfg.tools.exec.security_level = "strict".into();
+        cfg.tools.exec.allowlist = vec!["git*".into()];
+
+        let manager = approval_manager_from_config(&cfg);
+        assert_eq!(manager.mode, ApprovalMode::Always);
+        assert_eq!(manager.security_level, SecurityLevel::Deny);
+        assert_eq!(manager.allowlist, vec!["git*".to_string()]);
+    }
+
+    #[test]
+    fn approval_manager_falls_back_for_invalid_values() {
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.tools.exec.approval_mode = "bogus".into();
+        cfg.tools.exec.security_level = "bogus".into();
+
+        let manager = approval_manager_from_config(&cfg);
+        assert_eq!(manager.mode, ApprovalMode::OnMiss);
+        assert_eq!(manager.security_level, SecurityLevel::Allowlist);
+    }
+
+    #[tokio::test]
+    async fn discover_hooks_registers_builtin_handlers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_store = Arc::new(moltis_sessions::store::SessionStore::new(sessions_dir));
+
+        let (registry, info) =
+            discover_and_build_hooks(&HashSet::new(), Some(&session_store)).await;
+        let registry = registry.expect("expected hook registry to be created");
+        let handler_names = registry.handler_names();
+
+        assert!(handler_names.iter().any(|n| n == "boot-md"));
+        assert!(handler_names.iter().any(|n| n == "command-logger"));
+        assert!(handler_names.iter().any(|n| n == "session-memory"));
+
+        assert!(
+            info.iter()
+                .any(|h| h.name == "boot-md" && h.source == "builtin")
+        );
+        assert!(
+            info.iter()
+                .any(|h| h.name == "command-logger" && h.source == "builtin")
+        );
+        assert!(
+            info.iter()
+                .any(|h| h.name == "session-memory" && h.source == "builtin")
+        );
+    }
+
+    #[tokio::test]
+    async fn command_hook_dispatch_saves_session_memory_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_store = Arc::new(moltis_sessions::store::SessionStore::new(sessions_dir));
+
+        session_store
+            .append(
+                "smoke-session",
+                &serde_json::json!({"role": "user", "content": "Hello from smoke test"}),
+            )
+            .await
+            .unwrap();
+        session_store
+            .append(
+                "smoke-session",
+                &serde_json::json!({"role": "assistant", "content": "Hi there"}),
+            )
+            .await
+            .unwrap();
+
+        let mut registry = moltis_common::hooks::HookRegistry::new();
+        registry.register(Arc::new(
+            moltis_plugins::bundled::session_memory::SessionMemoryHook::new(
+                tmp.path().to_path_buf(),
+                Arc::clone(&session_store),
+            ),
+        ));
+
+        let payload = moltis_common::hooks::HookPayload::Command {
+            session_key: "smoke-session".into(),
+            action: "new".into(),
+            sender_id: None,
+        };
+        let result = registry.dispatch(&payload).await.unwrap();
+        assert!(matches!(result, moltis_common::hooks::HookAction::Continue));
+
+        let memory_dir = tmp.path().join("memory");
+        assert!(memory_dir.is_dir());
+
+        let files: Vec<_> = std::fs::read_dir(&memory_dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1);
+
+        let content = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(content.contains("smoke-session"));
+        assert!(content.contains("Hello from smoke test"));
+        assert!(content.contains("Hi there"));
+    }
 
     #[tokio::test]
     async fn websocket_header_auth_accepts_valid_session_cookie() {
@@ -3752,6 +4293,32 @@ mod tests {
         assert!(!is_same_origin("http://localhost", "localhost:8080"));
     }
 
+    #[cfg(feature = "web-ui")]
+    #[test]
+    fn asset_serving_sets_nosniff_header() {
+        let response = serve_asset("style.css", "no-cache");
+        assert_eq!(response.status(), StatusCode::OK);
+        let nosniff = response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(nosniff, Some("nosniff"));
+    }
+
+    #[cfg(feature = "web-ui")]
+    #[test]
+    fn svg_assets_get_restrictive_csp_header() {
+        let response = serve_asset("icons/icon-base.svg", "no-cache");
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(csp.contains("script-src 'none'"));
+        assert!(csp.contains("object-src 'none'"));
+    }
+
     #[test]
     fn same_origin_moltis_localhost() {
         // moltis.localhost ↔ localhost loopback variants
@@ -3771,6 +4338,27 @@ mod tests {
         assert!(is_same_origin(
             "https://app.moltis.localhost:8080",
             "localhost:8080"
+        ));
+    }
+
+    #[test]
+    fn prebuild_runs_only_when_mode_enabled_and_packages_present() {
+        let packages = vec!["curl".to_string()];
+        assert!(should_prebuild_sandbox_image(
+            &moltis_tools::sandbox::SandboxMode::All,
+            &packages
+        ));
+        assert!(should_prebuild_sandbox_image(
+            &moltis_tools::sandbox::SandboxMode::NonMain,
+            &packages
+        ));
+        assert!(!should_prebuild_sandbox_image(
+            &moltis_tools::sandbox::SandboxMode::Off,
+            &packages
+        ));
+        assert!(!should_prebuild_sandbox_image(
+            &moltis_tools::sandbox::SandboxMode::All,
+            &[]
         ));
     }
 

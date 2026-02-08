@@ -53,6 +53,10 @@ pub mod tailscale;
 pub mod tailscale_routes;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod tools_routes;
+pub mod update_check;
+pub mod voice;
+pub mod voice_agent_tools;
 pub mod ws;
 
 /// Run database migrations for the gateway crate.

@@ -527,14 +527,17 @@ impl DockerSandbox {
     }
 
     fn workspace_args(&self) -> Vec<String> {
-        let cwd = match std::env::current_dir() {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        let cwd_str = cwd.display().to_string();
+        let workspace_dir = moltis_config::data_dir();
+        let workspace_dir_str = workspace_dir.display().to_string();
         match self.config.workspace_mount {
-            WorkspaceMount::Ro => vec!["-v".to_string(), format!("{cwd_str}:{cwd_str}:ro")],
-            WorkspaceMount::Rw => vec!["-v".to_string(), format!("{cwd_str}:{cwd_str}:rw")],
+            WorkspaceMount::Ro => vec![
+                "-v".to_string(),
+                format!("{workspace_dir_str}:{workspace_dir_str}:ro"),
+            ],
+            WorkspaceMount::Rw => vec![
+                "-v".to_string(),
+                format!("{workspace_dir_str}:{workspace_dir_str}:rw"),
+            ],
             WorkspaceMount::None => Vec::new(),
         }
     }
@@ -1224,13 +1227,34 @@ fn auto_detect_backend(config: SandboxConfig) -> Arc<dyn Sandbox> {
         }
     }
 
-    if is_cli_available("docker") {
+    if should_use_docker_backend(is_cli_available("docker"), is_docker_daemon_available()) {
         tracing::info!("sandbox backend: docker");
         return Arc::new(DockerSandbox::new(config));
     }
 
-    tracing::warn!("no container runtime found; sandboxed execution will use direct host access");
+    if is_cli_available("docker") {
+        tracing::warn!(
+            "docker CLI detected but daemon is not accessible; sandboxed execution will use direct host access"
+        );
+    }
+
+    tracing::warn!(
+        "no usable container runtime found; sandboxed execution will use direct host access"
+    );
     Arc::new(NoSandbox)
+}
+
+fn should_use_docker_backend(docker_cli_available: bool, docker_daemon_available: bool) -> bool {
+    docker_cli_available && docker_daemon_available
+}
+
+fn is_docker_daemon_available() -> bool {
+    std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Check whether a CLI tool is available on PATH.
@@ -1949,6 +1973,14 @@ mod tests {
             let backend = select_backend(config);
             assert_eq!(backend.backend_name(), "apple-container");
         }
+    }
+
+    #[test]
+    fn test_should_use_docker_backend() {
+        assert!(should_use_docker_backend(true, true));
+        assert!(!should_use_docker_backend(true, false));
+        assert!(!should_use_docker_backend(false, true));
+        assert!(!should_use_docker_backend(false, false));
     }
 
     #[cfg(target_os = "linux")]

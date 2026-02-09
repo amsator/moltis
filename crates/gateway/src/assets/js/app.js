@@ -9,7 +9,7 @@ import { renderSessionProjectSelect } from "./project-combo.js";
 import { renderProjectSelect } from "./projects.js";
 import { initPWA } from "./pwa.js";
 import { initInstallBanner } from "./pwa-install.js";
-import { mount, navigate, registerPage } from "./router.js";
+import { mount, registerPage, sessionPath } from "./router.js";
 import { updateSandboxImageUI, updateSandboxUI } from "./sandbox.js";
 import { fetchSessions, refreshActiveSession, renderSessionList } from "./sessions.js";
 import * as S from "./state.js";
@@ -29,7 +29,6 @@ import "./page-hooks.js";
 import "./page-metrics.js";
 import "./page-settings.js";
 import "./page-images.js";
-import "./page-onboarding.js";
 import { setHasPasskeys } from "./page-login.js";
 
 // Import side-effect modules
@@ -37,9 +36,18 @@ import "./nav-counts.js";
 import "./session-search.js";
 import "./time-format.js";
 
-// Redirect root to /chats
+function preferredChatPath() {
+	var key = localStorage.getItem("moltis-session") || "main";
+	return sessionPath(key);
+}
+
+// Redirect root to the active/default chat session.
 registerPage("/", () => {
-	navigate("/chats");
+	var path = preferredChatPath();
+	if (location.pathname !== path) {
+		history.replaceState(null, "", path);
+	}
+	mount(path);
 });
 
 initTheme();
@@ -106,9 +114,7 @@ fetch("/api/auth/status")
 			return;
 		}
 		if (auth.setup_required) {
-			mount("/onboarding");
-			connect();
-			initInstallBanner();
+			window.location.assign("/onboarding");
 			return;
 		}
 		setHasPasskeys(auth.has_passkeys);
@@ -284,7 +290,12 @@ function fetchBootstrap() {
 }
 
 function startApp() {
-	mount(location.pathname);
+	var path = location.pathname;
+	if (path === "/") {
+		path = preferredChatPath();
+		history.replaceState(null, "", path);
+	}
+	mount(path);
 	connect();
 	fetchBootstrap();
 	initInstallBanner();

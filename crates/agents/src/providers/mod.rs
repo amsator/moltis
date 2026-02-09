@@ -1861,7 +1861,7 @@ mod tests {
             .collect();
         // Should only have the one specified model
         assert_eq!(xai_models.len(), 1);
-        assert_eq!(xai_models[0].id, "grok-3-mini");
+        assert_eq!(xai_models[0].id, "xai::grok-3-mini");
     }
 
     #[test]
@@ -1921,9 +1921,13 @@ mod tests {
             .filter(|m| m.provider == "openai-compatible")
             .collect();
         assert_eq!(compat_models.len(), 1);
-        assert_eq!(compat_models[0].id, "my-custom-model");
+        assert_eq!(compat_models[0].id, "openai-compatible::my-custom-model");
         // Should support tools (OpenAI-compatible)
-        assert!(reg.get("my-custom-model").unwrap().supports_tools());
+        assert!(
+            reg.get("openai-compatible::my-custom-model")
+                .unwrap()
+                .supports_tools()
+        );
     }
 
     #[test]

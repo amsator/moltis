@@ -51,7 +51,13 @@ impl DiscordOutbound {
 
 #[async_trait]
 impl ChannelOutbound for DiscordOutbound {
-    async fn send_text(&self, account_id: &str, to: &str, text: &str) -> Result<()> {
+    async fn send_text(
+        &self,
+        account_id: &str,
+        to: &str,
+        text: &str,
+        _reply_to: Option<&str>,
+    ) -> Result<()> {
         let http = self.get_http(account_id)?;
         let channel_id: u64 = to.parse()?;
         let channel = ChannelId::new(channel_id);
@@ -82,10 +88,17 @@ impl ChannelOutbound for DiscordOutbound {
         Ok(())
     }
 
-    async fn send_media(&self, account_id: &str, to: &str, payload: &ReplyPayload) -> Result<()> {
+    async fn send_media(
+        &self,
+        account_id: &str,
+        to: &str,
+        payload: &ReplyPayload,
+        reply_to: Option<&str>,
+    ) -> Result<()> {
         // For now, just send the text content. Media requires attachment API.
         if !payload.text.is_empty() {
-            self.send_text(account_id, to, &payload.text).await?;
+            self.send_text(account_id, to, &payload.text, reply_to)
+                .await?;
         }
         Ok(())
     }

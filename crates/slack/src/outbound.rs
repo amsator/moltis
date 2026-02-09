@@ -57,7 +57,13 @@ impl SlackOutbound {
 
 #[async_trait]
 impl ChannelOutbound for SlackOutbound {
-    async fn send_text(&self, account_id: &str, to: &str, text: &str) -> Result<()> {
+    async fn send_text(
+        &self,
+        account_id: &str,
+        to: &str,
+        text: &str,
+        _reply_to: Option<&str>,
+    ) -> Result<()> {
         let (client, token) = self.get_client(account_id)?;
         let channel_id: SlackChannelId = to.into();
         let thread_ts = self.get_thread_ts(account_id, to);
@@ -86,10 +92,17 @@ impl ChannelOutbound for SlackOutbound {
         Ok(())
     }
 
-    async fn send_media(&self, account_id: &str, to: &str, payload: &ReplyPayload) -> Result<()> {
+    async fn send_media(
+        &self,
+        account_id: &str,
+        to: &str,
+        payload: &ReplyPayload,
+        reply_to: Option<&str>,
+    ) -> Result<()> {
         // For now, just send the text content. Media upload requires file upload API.
         if !payload.text.is_empty() {
-            self.send_text(account_id, to, &payload.text).await?;
+            self.send_text(account_id, to, &payload.text, reply_to)
+                .await?;
         }
         Ok(())
     }

@@ -226,6 +226,7 @@ impl EventHandler for DiscordHandler {
                         channel_type: ChannelType::Discord,
                         account_id: self.account_id.clone(),
                         chat_id: channel_id.clone(),
+                        message_id: None,
                     };
 
                     match sink.dispatch_command(command, reply_to).await {
@@ -258,6 +259,7 @@ impl EventHandler for DiscordHandler {
             channel_type: ChannelType::Discord,
             account_id: self.account_id.clone(),
             chat_id: channel_id,
+            message_id: None,
         };
 
         let meta = ChannelMessageMeta {

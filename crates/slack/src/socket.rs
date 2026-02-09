@@ -216,6 +216,7 @@ async fn handle_command_events(
             channel_type: ChannelType::Slack,
             account_id: state.account_id.clone(),
             chat_id: event.channel_id.to_string(),
+            message_id: None,
         };
 
         if let Ok(response) = sink.dispatch_command(command, reply_to).await {
@@ -375,6 +376,7 @@ async fn handle_message_event(state: &SocketModeState, event: &SlackMessageEvent
         channel_type: ChannelType::Slack,
         account_id: state.account_id.clone(),
         chat_id: channel_id,
+        message_id: None,
     };
 
     let meta = ChannelMessageMeta {

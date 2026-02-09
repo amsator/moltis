@@ -216,11 +216,10 @@ MCP server connections.</p>
 </div>
 <h3 id="moltis_deploy_platform"><a class="header" href="#moltis_deploy_platform"><code>MOLTIS_DEPLOY_PLATFORM</code></a></h3>
 <p>Set this to the name of your cloud provider (e.g. <code>flyio</code>, <code>digitalocean</code>,
-<code>render</code>, <code>railway</code>). When set, Moltis hides local-only LLM providers
+<code>render</code>). When set, Moltis hides local-only LLM providers
 (local-llm and Ollama) from the provider setup page since they cannot run
 on cloud VMs. The included deploy templates for Fly.io, DigitalOcean, and
-Render already set this variable. Railway users should set it manually in
-the dashboard (<code>MOLTIS_DEPLOY_PLATFORM=railway</code>).</p>
+Render already set this variable.</p>
 <h2 id="flyio"><a class="header" href="#flyio">Fly.io</a></h2>
 <p>The repository includes a <code>fly.toml</code> ready to use.</p>
 <h3 id="quick-start"><a class="header" href="#quick-start">Quick start</a></h3>
@@ -292,24 +291,25 @@ persistent storage, consider using a DigitalOcean Droplet with Docker instead.</
 <li><strong>Environment</strong>: set <code>MOLTIS_PASSWORD</code> in the Render dashboard under
 <strong>Environment</strong> &gt; <strong>Secret Files</strong> or <strong>Environment Variables</strong></li>
 </ul>
-<h2 id="railway"><a class="header" href="#railway">Railway</a></h2>
-<p>The repository includes a <code>railway.json</code> configuration that sets the required
-environment variables (<code>MOLTIS_CONFIG_DIR</code>, <code>MOLTIS_DATA_DIR</code>,
-<code>MOLTIS_DEPLOY_PLATFORM</code>) automatically.</p>
-<ol>
-<li>Create a new project on <a href="https://railway.com">Railway</a></li>
-<li>Add a service from <strong>Docker Image</strong>: <code>ghcr.io/moltis-org/moltis:latest</code></li>
-<li>Railway injects the <code>$PORT</code> variable automatically; the <code>railway.json</code> start
-command handles the rest</li>
-<li>Set additional environment variables in the Railway dashboard:
-<ul>
-<li><code>MOLTIS_PASSWORD</code> = your password</li>
-</ul>
-</li>
-</ol>
-<h3 id="persistent-storage"><a class="header" href="#persistent-storage">Persistent storage</a></h3>
-<p>Railway supports persistent volumes. Add one in the service settings and mount
-it at <code>/data</code>.</p>
+<!-- TODO: Railway deploy does not work yet
+## Railway
+
+The repository includes a `railway.json` configuration that sets the required
+environment variables (`MOLTIS_CONFIG_DIR`, `MOLTIS_DATA_DIR`,
+`MOLTIS_DEPLOY_PLATFORM`) automatically.
+
+1. Create a new project on [Railway](https://railway.com)
+2. Add a service from **Docker Image**: `ghcr.io/moltis-org/moltis:latest`
+3. Railway injects the `$PORT` variable automatically; the `railway.json` start
+   command handles the rest
+4. Set additional environment variables in the Railway dashboard:
+   - `MOLTIS_PASSWORD` = your password
+
+### Persistent storage
+
+Railway supports persistent volumes. Add one in the service settings and mount
+it at `/data`.
+-->
 <h2 id="authentication"><a class="header" href="#authentication">Authentication</a></h2>
 <p>On first launch, Moltis requires a password or passkey to be set. In cloud
 deployments the easiest approach is to set the <code>MOLTIS_PASSWORD</code> environment
@@ -318,8 +318,6 @@ setup code flow is skipped.</p>
 <pre><code class="language-bash"># Fly.io
 fly secrets set MOLTIS_PASSWORD="your-secure-password"
 
-# Railway (via dashboard or CLI)
-railway variables set MOLTIS_PASSWORD="your-secure-password"
 </code></pre>
 <p>For Render and DigitalOcean, set the variable in the dashboard’s environment
 settings.</p>

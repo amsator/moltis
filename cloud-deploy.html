@@ -293,19 +293,16 @@ persistent storage, consider using a DigitalOcean Droplet with Docker instead.</
 <strong>Environment</strong> &gt; <strong>Secret Files</strong> or <strong>Environment Variables</strong></li>
 </ul>
 <h2 id="railway"><a class="header" href="#railway">Railway</a></h2>
-<p><a href="https://railway.com/template/new?repo=moltis-org/moltis"><img src="https://railway.com/button.svg" alt="Deploy on Railway" /></a></p>
-<p>The repository includes a <code>railway.json</code> configuration. Click the button above
-or:</p>
+<p>The repository includes a <code>railway.json</code> configuration that sets the required
+environment variables (<code>MOLTIS_CONFIG_DIR</code>, <code>MOLTIS_DATA_DIR</code>,
+<code>MOLTIS_DEPLOY_PLATFORM</code>) automatically.</p>
 <ol>
-<li>Create a new project on Railway</li>
+<li>Create a new project on <a href="https://railway.com">Railway</a></li>
 <li>Add a service from <strong>Docker Image</strong>: <code>ghcr.io/moltis-org/moltis:latest</code></li>
-<li>Railway injects the <code>$PORT</code> variable automatically</li>
-<li>Set environment variables:
+<li>Railway injects the <code>$PORT</code> variable automatically; the <code>railway.json</code> start
+command handles the rest</li>
+<li>Set additional environment variables in the Railway dashboard:
 <ul>
-<li><code>MOLTIS_NO_TLS</code> = <code>true</code></li>
-<li><code>MOLTIS_CONFIG_DIR</code> = <code>/data/config</code></li>
-<li><code>MOLTIS_DATA_DIR</code> = <code>/data</code></li>
-<li><code>MOLTIS_DEPLOY_PLATFORM</code> = <code>railway</code></li>
 <li><code>MOLTIS_PASSWORD</code> = your password</li>
 </ul>
 </li>
@@ -343,7 +340,7 @@ the gateway is ready. Configure your provider’s health check to use:</p>
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="streaming.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="system-prompt.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -357,7 +354,7 @@ the gateway is ready. Configure your provider’s health check to use:</p>
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="streaming.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="system-prompt.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>

@@ -657,7 +657,10 @@ async fn build_prompt_runtime_context(
                 scope: Some(config.scope.to_string()),
                 image: Some(router.resolve_image(session_key, None).await),
                 workspace_mount: Some(config.workspace_mount.to_string()),
-                no_network: Some(matches!(config.network, moltis_tools::sandbox::NetworkPolicy::Blocked)),
+                no_network: Some(matches!(
+                    config.network,
+                    moltis_tools::sandbox::NetworkPolicy::Blocked
+                )),
                 session_override: session_entry.and_then(|entry| entry.sandbox_enabled),
             })
         } else {

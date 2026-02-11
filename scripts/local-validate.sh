@@ -148,7 +148,7 @@ coverage_cmd="${LOCAL_VALIDATE_COVERAGE_CMD:-cargo llvm-cov --workspace --all-fe
 
 if [[ "$(uname -s)" == "Darwin" ]] && ! command -v nvcc >/dev/null 2>&1; then
   if [[ -z "${LOCAL_VALIDATE_LINT_CMD:-}" ]]; then
-    lint_cmd="cargo clippy --workspace -- -D warnings"
+    lint_cmd="cargo +nightly clippy --workspace -- -D warnings"
   fi
   if [[ -z "${LOCAL_VALIDATE_TEST_CMD:-}" ]]; then
     test_cmd="cargo test"

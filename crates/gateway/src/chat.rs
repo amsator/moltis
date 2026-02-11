@@ -1938,7 +1938,10 @@ impl ChatService for LiveChatService {
             .and_then(|v| v.as_str())
             .map(String::from);
         // Auto-compact: if conversation input tokens exceed 95% of context window, compact first.
-        let context_window = provider.context_window() as u64;
+        let context_window = match provider.model_metadata().await {
+            Ok(meta) => u64::from(meta.context_length),
+            Err(_) => u64::from(provider.context_window()),
+        };
         let total_input: u64 = history
             .iter()
             .filter_map(|m| m.get("inputTokens").and_then(|v| v.as_u64()))

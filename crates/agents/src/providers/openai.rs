@@ -18,6 +18,7 @@ pub struct OpenAiProvider {
     base_url: String,
     provider_name: String,
     client: reqwest::Client,
+    metadata_cache: tokio::sync::OnceCell<crate::model::ModelMetadata>,
 }
 
 impl OpenAiProvider {
@@ -28,6 +29,7 @@ impl OpenAiProvider {
             base_url,
             provider_name: "openai".into(),
             client: reqwest::Client::new(),
+            metadata_cache: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -43,6 +45,7 @@ impl OpenAiProvider {
             base_url,
             provider_name,
             client: reqwest::Client::new(),
+            metadata_cache: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -67,6 +70,55 @@ impl LlmProvider for OpenAiProvider {
 
     fn supports_vision(&self) -> bool {
         super::supports_vision_for_model(&self.model)
+    }
+
+    async fn model_metadata(&self) -> anyhow::Result<crate::model::ModelMetadata> {
+        let meta = self
+            .metadata_cache
+            .get_or_try_init(|| async {
+                let url = format!("{}/models/{}", self.base_url, self.model);
+                debug!(url = %url, model = %self.model, "fetching model metadata");
+
+                let resp = self
+                    .client
+                    .get(&url)
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", self.api_key.expose_secret()),
+                    )
+                    .send()
+                    .await?;
+
+                if !resp.status().is_success() {
+                    anyhow::bail!(
+                        "model metadata API returned HTTP {}",
+                        resp.status().as_u16()
+                    );
+                }
+
+                let body: serde_json::Value = resp.json().await?;
+
+                // OpenAI uses "context_window", some compat providers use "context_length".
+                let context_length = body
+                    .get("context_window")
+                    .or_else(|| body.get("context_length"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or_else(|| self.context_window());
+
+                debug!(
+                    model = %self.model,
+                    context_length,
+                    "model metadata fetched"
+                );
+
+                Ok(crate::model::ModelMetadata {
+                    id: self.model.clone(),
+                    context_length,
+                })
+            })
+            .await?;
+        Ok(meta.clone())
     }
 
     async fn complete(
@@ -512,5 +564,106 @@ mod tests {
 
         assert_eq!(text_deltas.join(""), "Let me help.");
         assert_eq!(tool_starts, vec!["my_tool"]);
+    }
+
+    // ── model_metadata tests ──────────────────────────────────────────
+
+    /// Start a mock server with both /chat/completions and /models/:model endpoints.
+    async fn start_model_metadata_mock(
+        model_response: Option<serde_json::Value>,
+    ) -> String {
+        use axum::routing::get;
+
+        let mut app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                "data: [DONE]\n\n"
+            }),
+        );
+
+        if let Some(resp) = model_response {
+            let resp_str = serde_json::to_string(&resp).unwrap();
+            app = app.route(
+                "/models/{model}",
+                get(move || {
+                    let body = resp_str.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            );
+        } else {
+            app = app.route(
+                "/models/{model}",
+                get(|| async {
+                    axum::response::Response::builder()
+                        .status(404)
+                        .body(axum::body::Body::from("not found"))
+                        .unwrap()
+                }),
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn model_metadata_returns_context_window_from_api() {
+        let base_url = start_model_metadata_mock(Some(serde_json::json!({
+            "id": "gpt-4o",
+            "context_window": 128000
+        })))
+        .await;
+
+        let provider = test_provider(&base_url);
+        let meta = provider.model_metadata().await.unwrap();
+        assert_eq!(meta.context_length, 128_000);
+        assert_eq!(meta.id, "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn model_metadata_uses_context_length_field() {
+        let base_url = start_model_metadata_mock(Some(serde_json::json!({
+            "id": "some-model",
+            "context_length": 64000
+        })))
+        .await;
+
+        let provider = test_provider(&base_url);
+        let meta = provider.model_metadata().await.unwrap();
+        assert_eq!(meta.context_length, 64_000);
+    }
+
+    #[tokio::test]
+    async fn model_metadata_fallback_on_api_error() {
+        let base_url = start_model_metadata_mock(None).await;
+
+        let provider = test_provider(&base_url);
+        let result = provider.model_metadata().await;
+        // API returns 404, so this should error
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn model_metadata_caches_result() {
+        let base_url = start_model_metadata_mock(Some(serde_json::json!({
+            "id": "gpt-4o",
+            "context_window": 128000
+        })))
+        .await;
+
+        let provider = test_provider(&base_url);
+        let meta1 = provider.model_metadata().await.unwrap();
+        let meta2 = provider.model_metadata().await.unwrap();
+        assert_eq!(meta1.context_length, meta2.context_length);
     }
 }

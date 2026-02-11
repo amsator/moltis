@@ -103,6 +103,10 @@ impl LlmProvider for RegistryModelProvider {
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
         self.inner.stream_with_tools(messages, tools)
     }
+
+    async fn model_metadata(&self) -> anyhow::Result<crate::model::ModelMetadata> {
+        self.inner.model_metadata().await
+    }
 }
 
 /// Resolve an API key from config (Secret) or environment variable,

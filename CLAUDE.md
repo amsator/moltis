@@ -942,7 +942,9 @@ integrate them together so nothing is lost.
 **Local validation:** When a PR exists, **always** run
 `./scripts/local-validate.sh <PR_NUMBER>` (e.g. `./scripts/local-validate.sh 63`)
 to check fmt, lint, and tests locally and publish commit statuses to the PR.
-Running the script without a PR number is useless — it skips status publishing.
+Never run it without a PR number.
+If the script auto-commits `Cargo.lock` (or any change), push first, then rerun
+`./scripts/local-validate.sh <PR_NUMBER>` so local `HEAD` matches the PR head.
 
 **PR description quality:** Every pull request must include a clear, reviewer-friendly
 description with at least these sections:

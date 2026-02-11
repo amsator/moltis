@@ -227,6 +227,7 @@ fn generate_otp_code() -> String {
 pub const OTP_CHALLENGE_MSG: &str = "To use this bot, please enter the verification code.\n\nAsk the bot owner for the code \u{2014} it is visible in the web UI under Channels \u{2192} Senders.\n\nThe code expires in 5 minutes.";
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

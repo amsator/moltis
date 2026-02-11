@@ -501,6 +501,7 @@ impl DeviceStore for SledStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

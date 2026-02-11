@@ -86,6 +86,7 @@ impl Default for WhatsAppAccountConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

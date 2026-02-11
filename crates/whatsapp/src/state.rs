@@ -103,6 +103,7 @@ pub(crate) fn has_bot_watermark(text: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -242,7 +242,9 @@ npx playwright show-trace test-results/&lt;test-dir&gt;/trace.zip
 </ul>
 <h2 id="ci-integration"><a class="header" href="#ci-integration">CI Integration</a></h2>
 <p>The <code>just ui-e2e</code> target is the intended command for CI.</p>
-<p>When adding CI coverage, gate pull requests on this target so UI regressions fail fast.</p>
+<p>Pull requests use the local-validation flow: the E2E workflow waits for a
+<code>local/e2e</code> commit status, published by <code>./scripts/local-validate.sh</code>.</p>
+<p>Pushes to <code>main</code>, tags, and manual dispatch still run the hosted E2E job.</p>
 
                     </main>
 

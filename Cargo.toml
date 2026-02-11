@@ -35,16 +35,22 @@ resolver = "2"
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+[workspace.lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"
+
 [workspace.package]
-edition    = "2024"
-license    = "MIT"
-repository = "https://github.com/moltis-org/moltis"
-version    = "0.3.8"
+edition      = "2024"
+license      = "MIT"
+repository   = "https://github.com/moltis-org/moltis"
+rust-version = "1.91"
+version      = "0.8.8"
 
 [workspace.dependencies]
 # Async runtime
 tokio = { features = ["full"], version = "1" }
 # HTTP/WS server
+askama     = "0.15"
 axum       = { features = ["ws"], version = "0.8" }
 axum-extra = "0.10"
 # Serialization
@@ -93,6 +99,7 @@ fd-lock      = "4"
 genai        = "0.5"
 gix          = "0.78"
 llama-cpp-2  = "0.1"
+mockito      = "1.7"
 open         = "5.3"
 rand         = "0.9"
 secrecy      = { features = ["serde"], version = "0.8" }
@@ -129,7 +136,7 @@ image          = { default-features = false, features = ["jpeg", "png", "webp"],
 pulldown-cmark = { default-features = false, version = "0.12" }
 # Filesystem / archiving
 chrono                = "0.4"
-chrono-tz             = { version = "0.10", features = ["serde"] }
+chrono-tz             = { features = ["serde"], version = "0.10" }
 cron                  = "0.13"
 dirs-next             = "2"
 flate2                = "1"
@@ -138,6 +145,7 @@ notify-debouncer-full = "0.7"
 tar                   = "0.4"
 tempfile              = "3"
 walkdir               = "2"
+which                 = "8"
 
 # Workspace crates
 moltis            = { path = "crates/cli" }
@@ -168,3 +176,7 @@ moltis-slack      = { path = "crates/slack" }
 moltis-telegram   = { path = "crates/telegram" }
 moltis-tools      = { path = "crates/tools" }
 moltis-voice      = { path = "crates/voice" }
+
+[profile.release]
+lto   = "thin"
+strip = true

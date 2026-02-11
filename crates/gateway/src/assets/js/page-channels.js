@@ -8,8 +8,9 @@ import { onEvent } from "./events.js";
 import { sendRpc } from "./helpers.js";
 import { updateNavCount } from "./nav-counts.js";
 import { navigate, registerPrefix } from "./router.js";
-import { connected, models as modelsSig } from "./signals.js";
+import { connected } from "./signals.js";
 import * as S from "./state.js";
+import { models as modelsSig } from "./stores/model-store.js";
 import { ConfirmDialog, Modal, ModelSelect, requestConfirm, showToast } from "./ui.js";
 
 var channels = signal([]);
@@ -87,12 +88,9 @@ function loadSenders() {
 	});
 }
 
-// ── Channel icons (inline SVG via htm) ───────────────────────
+// ── Channel icons ────────────────────────────────────────────
 function TelegramIcon() {
-	return html`<svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-    stroke="currentColor" stroke-width="1.5">
-    <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
-  </svg>`;
+	return html`<span class="icon icon-telegram"></span>`;
 }
 
 function SlackIcon() {
@@ -981,3 +979,26 @@ registerPrefix(
 		activeSection.value = "list";
 	},
 );
+
+// ── Exported init/teardown for settings page embedding ───────
+export function initChannels(container) {
+	containerRef = container;
+	container.style.cssText = "flex-direction:row;padding:0;overflow:hidden;";
+	activeSection.value = "list";
+	showAddModal.value = null;
+	editingChannel.value = null;
+	sendersAccount.value = "";
+	senders.value = [];
+	render(html`<${ChannelsPage} />`, container);
+}
+
+export function teardownChannels() {
+	S.setRefreshChannelsPage(null);
+	if (S.channelEventUnsub) {
+		S.channelEventUnsub();
+		S.setChannelEventUnsub(null);
+	}
+	if (containerRef) render(null, containerRef);
+	containerRef = null;
+	activeSection.value = "list";
+}

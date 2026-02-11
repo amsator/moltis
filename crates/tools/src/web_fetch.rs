@@ -65,10 +65,13 @@ impl WebFetchTool {
                 let now = Instant::now();
                 cache.retain(|_, e| e.expires_at > now);
             }
-            cache.insert(key, CacheEntry {
-                value,
-                expires_at: Instant::now() + self.cache_ttl,
-            });
+            cache.insert(
+                key,
+                CacheEntry {
+                    value,
+                    expires_at: Instant::now() + self.cache_ttl,
+                },
+            );
         }
     }
 
@@ -452,6 +455,7 @@ impl AgentTool for WebFetchTool {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

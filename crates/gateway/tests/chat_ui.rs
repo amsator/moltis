@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Integration tests for the embedded chat UI and WebSocket handshake.
 
 use std::{net::SocketAddr, sync::Arc};
@@ -222,6 +223,7 @@ async fn gateway_startup_with_llm_wiring_does_not_block() {
         services = services.with_model(Arc::new(LiveModelService::new(
             Arc::clone(&registry),
             Arc::new(tokio::sync::RwLock::new(DisabledModelsStore::default())),
+            Vec::new(),
             Vec::new(),
         )));
     }

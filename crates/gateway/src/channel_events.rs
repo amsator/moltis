@@ -72,10 +72,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         }
     }
@@ -108,10 +113,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 "sessionKey": &session_key,
                 "messageIndex": msg_index,
             });
-            broadcast(state, "chat", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "chat",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
 
             // Register the reply target so the chat "final" broadcast can
@@ -178,7 +188,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await;
 
-                    // Look up displayName for the notification.
+                    // Buffer model notification for the logbook instead of sending separately.
                     let display: String = if let Ok(models_val) = state.services.model.list().await
                         && let Some(models) = models_val.as_array()
                     {
@@ -191,17 +201,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     } else {
                         model.clone()
                     };
-                    if let Some(outbound) = state.services.channel_outbound_arc() {
-                        let msg = format!("Using *{display}*. Use /model to change.");
-                        let _ = outbound
-                            .send_text(
-                                &reply_to.account_id,
-                                &reply_to.chat_id,
-                                &msg,
-                                reply_to.message_id.as_deref(),
-                            )
-                            .await;
-                    }
+                    let msg = format!("Using {display}. Use /model to change.");
+                    state.push_channel_status_log(&session_key, msg).await;
                 }
             } else {
                 let session_has_model = if let Some(ref sm) = state.services.session_metadata {
@@ -216,8 +217,6 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     && let Some(id) = first.get("id").and_then(|v| v.as_str())
                 {
                     params["model"] = serde_json::json!(id);
-                    // Also persist on the session so subsequent messages
-                    // (including from the web UI) use the same model.
                     let _ = state
                         .services
                         .session
@@ -227,22 +226,13 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await;
 
-                    // Notify the user which model was auto-selected.
+                    // Buffer model notification for the logbook.
                     let display = first
                         .get("displayName")
                         .and_then(|v| v.as_str())
                         .unwrap_or(id);
-                    if let Some(outbound) = state.services.channel_outbound_arc() {
-                        let msg = format!("Using *{display}*. Use /model to change.");
-                        let _ = outbound
-                            .send_text(
-                                &reply_to.account_id,
-                                &reply_to.chat_id,
-                                &msg,
-                                reply_to.message_id.as_deref(),
-                            )
-                            .await;
-                    }
+                    let msg = format!("Using {display}. Use /model to change.");
+                    state.push_channel_status_log(&session_key, msg).await;
                 }
             }
 
@@ -356,10 +346,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         } else {
             warn!("request_disable_account: gateway not ready");
@@ -401,19 +396,16 @@ impl ChannelEventSink for GatewayChannelEventSink {
             .get()
             .ok_or_else(|| anyhow!("gateway not ready"))?;
 
-        // Encode audio as base64 for the STT service
-        let audio_base64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, audio_data);
-
-        let params = serde_json::json!({
-            "audio": audio_base64,
-            "format": format,
-        });
-
         let result = state
             .services
             .stt
-            .transcribe(params)
+            .transcribe_bytes(
+                bytes::Bytes::copy_from_slice(audio_data),
+                format,
+                None,
+                None,
+                None,
+            )
             .await
             .map_err(|e| anyhow!("transcription failed: {}", e))?;
 
@@ -457,7 +449,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
         };
 
         // Update in-memory cache.
-        let geo = moltis_config::GeoLocation::now(latitude, longitude);
+        let geo = moltis_config::GeoLocation::now(latitude, longitude, None);
         state.inner.write().await.cached_location = Some(geo.clone());
 
         // Persist to USER.md (best-effort).
@@ -564,10 +556,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
             "messageIndex": msg_index,
             "hasAttachments": true,
         });
-        broadcast(state, "chat", payload, BroadcastOpts {
-            drop_if_slow: true,
-            ..Default::default()
-        })
+        broadcast(
+            state,
+            "chat",
+            payload,
+            BroadcastOpts {
+                drop_if_slow: true,
+                ..Default::default()
+            },
+        )
         .await;
 
         // Register the reply target
@@ -637,17 +634,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 } else {
                     model.clone()
                 };
-                if let Some(outbound) = state.services.channel_outbound_arc() {
-                    let msg = format!("Using *{display}*. Use /model to change.");
-                    let _ = outbound
-                        .send_text(
-                            &reply_to.account_id,
-                            &reply_to.chat_id,
-                            &msg,
-                            reply_to.message_id.as_deref(),
-                        )
-                        .await;
-                }
+                let msg = format!("Using {display}. Use /model to change.");
+                state.push_channel_status_log(&session_key, msg).await;
             }
         } else {
             let session_has_model = if let Some(ref sm) = state.services.session_metadata {
@@ -675,17 +663,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     .get("displayName")
                     .and_then(|v| v.as_str())
                     .unwrap_or(id);
-                if let Some(outbound) = state.services.channel_outbound_arc() {
-                    let msg = format!("Using *{display}*. Use /model to change.");
-                    let _ = outbound
-                        .send_text(
-                            &reply_to.account_id,
-                            &reply_to.chat_id,
-                            &msg,
-                            reply_to.message_id.as_deref(),
-                        )
-                        .await;
-                }
+                let msg = format!("Using {display}. Use /model to change.");
+                state.push_channel_status_log(&session_key, msg).await;
             }
         }
 
@@ -1115,7 +1094,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .and_then(|v| v.as_str())
                         .unwrap_or(model_id);
 
-                    state
+                    let patch_res = state
                         .services
                         .session
                         .patch(serde_json::json!({
@@ -1124,6 +1103,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
                     broadcast(
                         state,
@@ -1131,6 +1114,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         serde_json::json!({
                             "kind": "patched",
                             "sessionKey": &session_key,
+                            "version": version,
                         }),
                         BroadcastOpts {
                             drop_if_slow: true,
@@ -1203,7 +1187,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     Ok(lines.join("\n"))
                 } else if args == "on" || args == "off" {
                     let new_val = args == "on";
-                    state
+                    let patch_res = state
                         .services
                         .session
                         .patch(serde_json::json!({
@@ -1212,12 +1196,17 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     broadcast(
                         state,
                         "session",
                         serde_json::json!({
                             "kind": "patched",
                             "sessionKey": &session_key,
+                            "version": version,
                         }),
                         BroadcastOpts {
                             drop_if_slow: true,
@@ -1255,7 +1244,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     } else {
                         chosen.as_str()
                     };
-                    state
+                    let patch_res = state
                         .services
                         .session
                         .patch(serde_json::json!({
@@ -1264,6 +1253,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
                     broadcast(
                         state,
@@ -1271,6 +1264,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         serde_json::json!({
                             "kind": "patched",
                             "sessionKey": &session_key,
+                            "version": version,
                         }),
                         BroadcastOpts {
                             drop_if_slow: true,
@@ -1319,6 +1313,7 @@ fn format_model_list(
     lines.join("\n")
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use {super::*, moltis_channels::ChannelType};

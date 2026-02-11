@@ -158,9 +158,12 @@ impl OtpState {
         challenge.attempts += 1;
         if challenge.attempts >= MAX_ATTEMPTS {
             self.challenges.remove(peer_id);
-            self.lockouts.insert(peer_id.to_string(), Lockout {
-                until: now + self.cooldown,
-            });
+            self.lockouts.insert(
+                peer_id.to_string(),
+                Lockout {
+                    until: now + self.cooldown,
+                },
+            );
             return OtpVerifyResult::LockedOut;
         }
 
@@ -225,6 +228,7 @@ fn generate_otp_code() -> String {
     code.to_string()
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,7 +2,9 @@ mod auth_commands;
 mod browser_commands;
 mod config_commands;
 mod db_commands;
+mod doctor_commands;
 mod hooks_commands;
+mod memory_commands;
 mod sandbox_commands;
 #[cfg(feature = "tailscale")]
 mod tailscale_commands;
@@ -10,13 +12,13 @@ mod tailscale_commands;
 use {
     anyhow::anyhow,
     clap::{Parser, Subcommand},
-    moltis_gateway::logs::{LogBroadcastLayer, LogBuffer},
+    moltis_gateway::logs::{EnabledLogLevels, LogBroadcastLayer, LogBuffer},
     tracing::info,
     tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
 };
 
 #[derive(Parser)]
-#[command(name = "moltis", about = "Moltis — personal AI gateway")]
+#[command(name = "moltis", about = "Moltis — personal AI gateway", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -125,6 +127,11 @@ enum Commands {
         #[command(subcommand)]
         action: db_commands::DbAction,
     },
+    /// Memory search and status.
+    Memory {
+        #[command(subcommand)]
+        action: memory_commands::MemoryAction,
+    },
     /// Tailscale Serve/Funnel management.
     #[cfg(feature = "tailscale")]
     Tailscale {
@@ -182,7 +189,16 @@ fn init_telemetry(cli: &Cli, log_buffer: Option<LogBuffer>) {
     // - "WS Invalid message" warnings (Chrome sends CDP events the library doesn't recognize)
     // - "WS Connection error" errors (normal when idle connections are closed)
     // These are expected browser sandbox behavior, not actionable errors.
-    let filter = base_filter.add_directive("chromiumoxide=off".parse().unwrap());
+    let filter = if let Ok(directive) = "chromiumoxide=off".parse() {
+        base_filter.add_directive(directive)
+    } else {
+        base_filter
+    };
+
+    if let Some(ref buffer) = log_buffer {
+        let levels = EnabledLogLevels::from_max_level_hint(filter.max_level_hint());
+        buffer.set_enabled_levels(levels);
+    }
 
     let registry = tracing_subscriber::registry().with(filter);
 
@@ -373,10 +389,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Sandbox { action }) => sandbox_commands::handle_sandbox(action).await,
         Some(Commands::Browser { action }) => browser_commands::handle_browser(action),
         Some(Commands::Db { action }) => db_commands::handle_db(action).await,
+        Some(Commands::Memory { action }) => memory_commands::handle_memory(action).await,
         #[cfg(feature = "tailscale")]
         Some(Commands::Tailscale { action }) => tailscale_commands::handle_tailscale(action).await,
         Some(Commands::Skills { action }) => handle_skills(action).await,
         Some(Commands::Config { action }) => config_commands::handle_config(action).await,
+        Some(Commands::Doctor) => doctor_commands::handle_doctor().await,
         Some(Commands::Hooks { action }) => hooks_commands::handle_hooks(action).await,
         #[cfg(feature = "tls")]
         Some(Commands::TrustCa) => trust_ca().await,

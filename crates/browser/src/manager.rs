@@ -49,6 +49,19 @@ impl Default for BrowserManager {
 impl BrowserManager {
     /// Create a new browser manager with the given configuration.
     pub fn new(config: BrowserConfig) -> Self {
+        match crate::container::cleanup_stale_browser_containers(&config.container_prefix) {
+            Ok(removed) if removed > 0 => {
+                info!(
+                    removed,
+                    "removed stale browser containers from previous runs"
+                );
+            },
+            Ok(_) => {},
+            Err(e) => {
+                warn!(error = %e, "failed to clean stale browser containers at startup");
+            },
+        }
+
         info!(
             sandbox_image = %config.sandbox_image,
             "browser manager initialized (sandbox mode controlled per-session)"
@@ -395,31 +408,29 @@ impl BrowserManager {
         let (x, y) = find_element_by_ref(&page, ref_).await?;
 
         // Dispatch mouse events
-        page.execute(
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MousePressed)
-                .x(x)
-                .y(y)
-                .button(MouseButton::Left)
-                .click_count(1)
-                .build()
-                .unwrap(),
-        )
-        .await
-        .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+        let press_cmd = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MousePressed)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+        page.execute(press_cmd)
+            .await
+            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
 
-        page.execute(
-            DispatchMouseEventParams::builder()
-                .r#type(DispatchMouseEventType::MouseReleased)
-                .x(x)
-                .y(y)
-                .button(MouseButton::Left)
-                .click_count(1)
-                .build()
-                .unwrap(),
-        )
-        .await
-        .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+        let release_cmd = DispatchMouseEventParams::builder()
+            .r#type(DispatchMouseEventType::MouseReleased)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+        page.execute(release_cmd)
+            .await
+            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
 
         debug!(
             session_id = sid,
@@ -449,25 +460,23 @@ impl BrowserManager {
 
         // Type each character
         for c in text.chars() {
-            page.execute(
-                DispatchKeyEventParams::builder()
-                    .r#type(DispatchKeyEventType::KeyDown)
-                    .text(c.to_string())
-                    .build()
-                    .unwrap(),
-            )
-            .await
-            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+            let key_down = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .text(c.to_string())
+                .build()
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+            page.execute(key_down)
+                .await
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
 
-            page.execute(
-                DispatchKeyEventParams::builder()
-                    .r#type(DispatchKeyEventType::KeyUp)
-                    .text(c.to_string())
-                    .build()
-                    .unwrap(),
-            )
-            .await
-            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+            let key_up = DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .text(c.to_string())
+                .build()
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
+            page.execute(key_up)
+                .await
+                .map_err(|e| BrowserError::Cdp(e.to_string()))?;
         }
 
         debug!(
@@ -556,7 +565,7 @@ impl BrowserManager {
         let check_js = if let Some(ref selector) = selector {
             format!(
                 r#"document.querySelector({}) !== null"#,
-                serde_json::to_string(selector).unwrap()
+                serde_json::to_string(selector).map_err(|e| BrowserError::Cdp(e.to_string()))?
             )
         } else if let Some(ref_) = ref_ {
             format!(r#"document.querySelector('[data-moltis-ref="{ref_}"]') !== null"#)
@@ -750,6 +759,13 @@ impl BrowserManager {
         Ok(())
     }
 
+    /// Close a specific browser session by ID.
+    pub async fn close_session(&self, session_id: &str) {
+        if let Err(e) = self.pool.close_session(session_id).await {
+            warn!(session_id, error = %e, "failed to close browser session");
+        }
+    }
+
     /// Clean up idle browser instances.
     pub async fn cleanup_idle(&self) {
         self.pool.cleanup_idle().await;
@@ -888,5 +904,26 @@ mod tests {
     fn test_validate_url_malformed() {
         assert!(validate_url("not a url").is_err());
         assert!(validate_url("://missing.scheme").is_err());
+    }
+
+    #[tokio::test]
+    async fn manager_close_session_nonexistent_is_noop() {
+        let manager = BrowserManager::default();
+        // Should not panic — logs a warning and returns.
+        manager.close_session("nonexistent").await;
+    }
+
+    #[tokio::test]
+    async fn manager_cleanup_idle_empty() {
+        let manager = BrowserManager::default();
+        manager.cleanup_idle().await;
+        assert_eq!(manager.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn manager_shutdown_empty() {
+        let manager = BrowserManager::default();
+        manager.shutdown().await;
+        assert_eq!(manager.active_count().await, 0);
     }
 }

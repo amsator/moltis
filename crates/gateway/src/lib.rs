@@ -43,6 +43,7 @@ pub mod provider_setup;
 pub mod push;
 #[cfg(feature = "push-notifications")]
 pub mod push_routes;
+pub mod request_throttle;
 pub mod server;
 pub mod services;
 pub mod session;
@@ -56,6 +57,7 @@ pub mod tls;
 pub mod tools_routes;
 pub mod tts_phrases;
 pub mod update_check;
+pub mod upload_routes;
 pub mod voice;
 pub mod voice_agent_tools;
 pub mod ws;

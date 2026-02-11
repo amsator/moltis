@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     path::PathBuf,
     process::Stdio,
@@ -12,7 +12,7 @@ use {
     serde::{Deserialize, Serialize},
     serde_json::Value,
     tokio::{
-        sync::{OnceCell, OwnedSemaphorePermit, RwLock, Semaphore},
+        sync::{OnceCell, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
         task::AbortHandle,
     },
     tokio_stream::StreamExt,
@@ -23,11 +23,13 @@ use moltis_config::MessageQueueMode;
 
 use {
     moltis_agents::{
-        AgentRunError, ChatMessage,
+        AgentRunError, ChatMessage, ContentPart, UserContent,
         model::{StreamEvent, values_to_chat_messages},
+        multimodal::parse_data_uri,
         prompt::{
             PromptHostRuntimeContext, PromptRuntimeContext, PromptSandboxRuntimeContext,
-            build_system_prompt_minimal_runtime, build_system_prompt_with_session_runtime,
+            VOICE_REPLY_SUFFIX, build_system_prompt_minimal_runtime,
+            build_system_prompt_with_session_runtime,
         },
         providers::{ProviderRegistry, raw_model_id},
         runner::{RunnerEvent, run_agent_loop_streaming},
@@ -45,11 +47,66 @@ use crate::{
     broadcast::{BroadcastOpts, broadcast},
     chat_error::parse_chat_error,
     services::{ChatService, ModelService, ServiceResult},
+    session::extract_preview_from_value,
     state::GatewayState,
 };
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
+
+/// Convert session-crate `MessageContent` to agents-crate `UserContent`.
+///
+/// The two types have different image representations:
+/// - `ContentBlock::ImageUrl` stores a data URI string
+/// - `ContentPart::Image` stores separated `media_type` + `data` fields
+fn to_user_content(mc: &MessageContent) -> UserContent {
+    match mc {
+        MessageContent::Text(text) => UserContent::Text(text.clone()),
+        MessageContent::Multimodal(blocks) => {
+            let parts: Vec<ContentPart> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(ContentPart::Text(text.clone())),
+                    ContentBlock::ImageUrl { image_url } => match parse_data_uri(&image_url.url) {
+                        Some((media_type, data)) => {
+                            debug!(
+                                media_type,
+                                data_len = data.len(),
+                                "to_user_content: parsed image from data URI"
+                            );
+                            Some(ContentPart::Image {
+                                media_type: media_type.to_string(),
+                                data: data.to_string(),
+                            })
+                        },
+                        None => {
+                            warn!(
+                                url_prefix = &image_url.url[..image_url.url.len().min(80)],
+                                "to_user_content: failed to parse data URI, dropping image"
+                            );
+                            None
+                        },
+                    },
+                })
+                .collect();
+            let text_count = parts
+                .iter()
+                .filter(|p| matches!(p, ContentPart::Text(_)))
+                .count();
+            let image_count = parts
+                .iter()
+                .filter(|p| matches!(p, ContentPart::Image { .. }))
+                .count();
+            debug!(
+                text_count,
+                image_count,
+                total_blocks = blocks.len(),
+                "to_user_content: converted multimodal content"
+            );
+            UserContent::Multimodal(parts)
+        },
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,20 +183,80 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn normalize_model_key(value: &str) -> String {
+pub(crate) fn normalize_model_key(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut last_was_separator = true;
+
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+            continue;
+        }
+
+        if !last_was_separator {
+            normalized.push(' ');
+            last_was_separator = true;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+fn normalize_provider_key(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn is_allowlist_exempt_provider(provider_name: &str) -> bool {
+    matches!(
+        normalize_provider_key(provider_name).as_str(),
+        "local-llm" | "ollama"
+    )
+}
+
+/// Returns `true` if the model matches the allowlist patterns.
+/// An empty pattern list means all models are allowed.
+/// Matching is case-insensitive substring against the full model ID, raw model
+/// ID, and display name.
+pub(crate) fn model_matches_allowlist(
+    model: &moltis_agents::providers::ModelInfo,
+    patterns: &[String],
+) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    if is_allowlist_exempt_provider(&model.provider) {
+        return true;
+    }
+    let full = normalize_model_key(&model.id);
+    let raw = normalize_model_key(raw_model_id(&model.id));
+    let display = normalize_model_key(&model.display_name);
+    patterns.iter().any(|p| {
+        full.contains(p.as_str()) || raw.contains(p.as_str()) || display.contains(p.as_str())
+    })
+}
+
+pub(crate) fn model_matches_allowlist_with_provider(
+    model: &moltis_agents::providers::ModelInfo,
+    provider_name: Option<&str>,
+    patterns: &[String],
+) -> bool {
+    if provider_name.is_some_and(is_allowlist_exempt_provider) {
+        return true;
+    }
+    model_matches_allowlist(model, patterns)
 }
 
 fn provider_filter_from_params(params: &Value) -> Option<String> {
     params
         .get("provider")
         .and_then(|v| v.as_str())
-        .map(normalize_model_key)
+        .map(normalize_provider_key)
         .filter(|v| !v.is_empty())
 }
 
 fn provider_matches_filter(model_provider: &str, provider_filter: Option<&str>) -> bool {
-    provider_filter.is_none_or(|expected| normalize_model_key(model_provider) == expected)
+    provider_filter.is_none_or(|expected| normalize_provider_key(model_provider) == expected)
 }
 
 fn probe_max_parallel_per_provider(params: &Value) -> usize {
@@ -148,6 +265,28 @@ fn probe_max_parallel_per_provider(params: &Value) -> usize {
         .and_then(|v| v.as_u64())
         .map(|v| v.clamp(1, 8) as usize)
         .unwrap_or(1)
+}
+
+fn provider_model_entry(model_id: &str, display_name: &str) -> Value {
+    serde_json::json!({
+        "modelId": model_id,
+        "displayName": display_name,
+    })
+}
+
+fn push_provider_model(
+    grouped: &mut BTreeMap<String, Vec<Value>>,
+    provider_name: &str,
+    model_id: &str,
+    display_name: &str,
+) {
+    if provider_name.trim().is_empty() || model_id.trim().is_empty() {
+        return;
+    }
+    grouped
+        .entry(provider_name.to_string())
+        .or_default()
+        .push(provider_model_entry(model_id, display_name));
 }
 
 const PROBE_RATE_LIMIT_INITIAL_BACKOFF_MS: u64 = 1_000;
@@ -788,6 +927,7 @@ pub struct LiveModelService {
     state: Arc<OnceCell<Arc<GatewayState>>>,
     detect_gate: Arc<Semaphore>,
     priority_order: HashMap<String, usize>,
+    allowed_models: Vec<String>,
 }
 
 impl LiveModelService {
@@ -795,6 +935,7 @@ impl LiveModelService {
         providers: Arc<RwLock<ProviderRegistry>>,
         disabled: Arc<RwLock<DisabledModelsStore>>,
         priority_models: Vec<String>,
+        allowed_models: Vec<String>,
     ) -> Self {
         let mut priority_order = HashMap::new();
         for (idx, model) in priority_models.into_iter().enumerate() {
@@ -803,12 +944,18 @@ impl LiveModelService {
                 let _ = priority_order.entry(key).or_insert(idx);
             }
         }
+        let allowed_models: Vec<String> = allowed_models
+            .into_iter()
+            .map(|p| normalize_model_key(&p))
+            .filter(|p| !p.is_empty())
+            .collect();
         Self {
             providers,
             disabled,
             state: Arc::new(OnceCell::new()),
             detect_gate: Arc::new(Semaphore::new(1)),
             priority_order,
+            allowed_models,
         }
     }
 
@@ -868,7 +1015,15 @@ impl ModelService for LiveModelService {
             reg.list_models()
                 .iter()
                 .filter(|m| !disabled.is_disabled(&m.id))
-                .filter(|m| disabled.unsupported_info(&m.id).is_none()),
+                .filter(|m| disabled.unsupported_info(&m.id).is_none())
+                .filter(|m| {
+                    let provider_name = reg.get(&m.id).map(|p| p.name().to_string());
+                    model_matches_allowlist_with_provider(
+                        m,
+                        provider_name.as_deref(),
+                        &self.allowed_models,
+                    )
+                }),
         );
         let models: Vec<_> = prioritized
             .iter()
@@ -893,7 +1048,10 @@ impl ModelService for LiveModelService {
     async fn list_all(&self) -> ServiceResult {
         let reg = self.providers.read().await;
         let disabled = self.disabled.read().await;
-        let prioritized = self.prioritize_models(reg.list_models().iter());
+        let prioritized = self.prioritize_models(reg.list_models().iter().filter(|m| {
+            let provider_name = reg.get(&m.id).map(|p| p.name().to_string());
+            model_matches_allowlist_with_provider(m, provider_name.as_deref(), &self.allowed_models)
+        }));
         let models: Vec<_> = prioritized
             .iter()
             .copied()
@@ -1087,6 +1245,9 @@ impl ModelService for LiveModelService {
         let mut flagged = 0usize;
         let mut cleared = 0usize;
         let mut errors = 0usize;
+        let mut supported_by_provider: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        let mut unsupported_by_provider: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        let mut errors_by_provider: BTreeMap<String, Vec<Value>> = BTreeMap::new();
 
         while let Some(joined) = tasks.next().await {
             checked += 1;
@@ -1127,6 +1288,12 @@ impl ModelService for LiveModelService {
             match outcome.status {
                 ProbeStatus::Supported => {
                     supported += 1;
+                    push_provider_model(
+                        &mut supported_by_provider,
+                        &outcome.provider_name,
+                        &outcome.model_id,
+                        &outcome.display_name,
+                    );
                     let mut changed = false;
                     {
                         let mut store = self.disabled.write().await;
@@ -1166,6 +1333,12 @@ impl ModelService for LiveModelService {
                 },
                 ProbeStatus::Unsupported { detail, provider } => {
                     unsupported += 1;
+                    push_provider_model(
+                        &mut unsupported_by_provider,
+                        &outcome.provider_name,
+                        &outcome.model_id,
+                        &outcome.display_name,
+                    );
                     let mut changed = false;
                     let mut updated_at_ms = now_ms();
                     {
@@ -1214,6 +1387,12 @@ impl ModelService for LiveModelService {
                 },
                 ProbeStatus::Error { message } => {
                     errors += 1;
+                    push_provider_model(
+                        &mut errors_by_provider,
+                        &outcome.provider_name,
+                        &outcome.model_id,
+                        &outcome.display_name,
+                    );
                     results.push(serde_json::json!({
                         "modelId": outcome.model_id,
                         "displayName": outcome.display_name,
@@ -1260,6 +1439,9 @@ impl ModelService for LiveModelService {
             "flagged": flagged,
             "cleared": cleared,
             "errors": errors,
+            "supportedByProvider": supported_by_provider,
+            "unsupportedByProvider": unsupported_by_provider,
+            "errorsByProvider": errors_by_provider,
             "results": results,
         });
 
@@ -1281,6 +1463,46 @@ impl ModelService for LiveModelService {
         }
 
         Ok(summary)
+    }
+
+    async fn test(&self, params: Value) -> ServiceResult {
+        let model_id = params
+            .get("modelId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'modelId' parameter".to_string())?;
+
+        let provider = {
+            let reg = self.providers.read().await;
+            reg.get(model_id)
+                .ok_or_else(|| format!("unknown model: {model_id}"))?
+        };
+
+        let probe = [ChatMessage::user("ping")];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            provider.complete(&probe, &[]),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => Ok(serde_json::json!({
+                "ok": true,
+                "modelId": model_id,
+            })),
+            Ok(Err(err)) => {
+                let error_text = err.to_string();
+                let error_obj =
+                    crate::chat_error::parse_chat_error(&error_text, Some(provider.name()));
+                let detail = error_obj
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&error_text)
+                    .to_string();
+
+                Err(detail)
+            },
+            Err(_) => Err("Connection timed out after 20 seconds".to_string()),
+        }
     }
 }
 
@@ -1695,6 +1917,10 @@ impl ChatService for LiveChatService {
         // Generate run_id early so we can link the user message to its agent run.
         let run_id = uuid::Uuid::new_v4().to_string();
 
+        // Convert session-crate content to agents-crate content for the LLM.
+        // Must happen before `message_content` is moved into `user_msg`.
+        let user_content = to_user_content(&message_content);
+
         // Build the user message for later persistence (deferred until we
         // know the message won't be queued — avoids double-persist when a
         // queued message is replayed via send()).
@@ -1969,6 +2195,18 @@ impl ChatService for LiveChatService {
             warn!("failed to persist user message: {e}");
         }
 
+        // Set preview from the first user message if not already set.
+        if let Some(entry) = self.session_metadata.get(&session_key).await
+            && entry.preview.is_none()
+        {
+            let preview_text = extract_preview_from_value(&user_msg.to_value());
+            if let Some(preview) = preview_text {
+                self.session_metadata
+                    .set_preview(&session_key, Some(&preview))
+                    .await;
+            }
+        }
+
         let agent_timeout_secs = moltis_config::discover_and_load().tools.agent_timeout_secs;
 
         let message_queue = Arc::clone(&self.message_queue);
@@ -1998,7 +2236,7 @@ impl ChatService for LiveChatService {
                         &run_id_clone,
                         provider,
                         &model_id,
-                        &text,
+                        &user_content,
                         &provider_name,
                         &history,
                         &session_key_clone,
@@ -2019,7 +2257,7 @@ impl ChatService for LiveChatService {
                         provider,
                         &model_id,
                         &tool_registry,
-                        &text,
+                        &user_content,
                         &provider_name,
                         &history,
                         &session_key_clone,
@@ -2124,7 +2362,9 @@ impl ChatService for LiveChatService {
                 match queue_mode {
                     MessageQueueMode::Followup => {
                         let mut iter = queued.into_iter();
-                        let first = iter.next().expect("queued is non-empty");
+                        let Some(first) = iter.next() else {
+                            return;
+                        };
                         // Put remaining messages back so the replayed run's
                         // own drain loop picks them up after it completes.
                         let rest: Vec<QueuedMessage> = iter.collect();
@@ -2153,7 +2393,10 @@ impl ChatService for LiveChatService {
                                 "replaying collected messages"
                             );
                             // Use the last queued message as the base params, override text.
-                            let mut merged = queued.last().unwrap().params.clone();
+                            let Some(last) = queued.last() else {
+                                return;
+                            };
+                            let mut merged = last.params.clone();
                             merged["text"] = serde_json::json!(combined.join("\n\n"));
                             if let Err(e) = chat.send(merged).await {
                                 warn!(session = %session_key_clone, error = %e, "failed to replay collected messages");
@@ -2269,6 +2512,8 @@ impl ChatService for LiveChatService {
             .await;
         }
 
+        // send_sync is text-only (used by API calls and channels).
+        let user_content = UserContent::text(&text);
         let result = if stream_only {
             run_streaming(
                 &state,
@@ -2276,7 +2521,7 @@ impl ChatService for LiveChatService {
                 &run_id,
                 provider,
                 &model_id,
-                &text,
+                &user_content,
                 &provider_name,
                 &history,
                 &session_key,
@@ -2297,7 +2542,7 @@ impl ChatService for LiveChatService {
                 provider,
                 &model_id,
                 &tool_registry,
-                &text,
+                &user_content,
                 &provider_name,
                 &history,
                 &session_key,
@@ -2463,8 +2708,22 @@ impl ChatService for LiveChatService {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Reset metadata message count.
+        // Reset metadata message count and preview.
         self.session_metadata.touch(&session_key, 0).await;
+        self.session_metadata.set_preview(&session_key, None).await;
+
+        // Notify all WebSocket clients so the web UI clears the session
+        // even when /clear is issued from a channel (e.g. Telegram).
+        broadcast(
+            &self.state,
+            "chat",
+            serde_json::json!({
+                "sessionKey": session_key,
+                "state": "session_cleared",
+            }),
+            BroadcastOpts::default(),
+        )
+        .await;
 
         info!(session = %session_key, "chat.clear");
         Ok(serde_json::json!({ "ok": true }))
@@ -2533,23 +2792,17 @@ impl ChatService for LiveChatService {
             }
         }
 
-        // Build a summary prompt from the conversation.
-        let mut conversation_text = String::new();
-        for msg in &history {
-            let role = msg
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            conversation_text.push_str(&format!("{role}: {content}\n\n"));
-        }
-
-        let summary_messages = vec![
-            ChatMessage::system(
-                "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble.",
-            ),
-            ChatMessage::user(&conversation_text),
-        ];
+        // Build a summary prompt from the conversation using structured messages.
+        // We pass the typed ChatMessage objects directly so role boundaries are
+        // maintained via the API's message structure, preventing prompt injection
+        // where user content could mimic role prefixes in concatenated text.
+        let mut summary_messages = vec![ChatMessage::system(
+            "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
+        )];
+        summary_messages.extend(values_to_chat_messages(&history));
+        summary_messages.push(ChatMessage::user(
+            "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
+        ));
 
         // Use the session's model if available, otherwise fall back to the model
         // from the last assistant message, then to the first registered provider.
@@ -3257,6 +3510,19 @@ async fn clear_unsupported_model(
     }
 }
 
+fn ordered_runner_event_callback() -> (
+    Box<dyn Fn(RunnerEvent) + Send + Sync>,
+    mpsc::UnboundedReceiver<RunnerEvent>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel::<RunnerEvent>();
+    let callback: Box<dyn Fn(RunnerEvent) + Send + Sync> = Box::new(move |event| {
+        if tx.send(event).is_err() {
+            debug!("runner event dropped because event processor is closed");
+        }
+    });
+    (callback, rx)
+}
+
 async fn run_with_tools(
     state: &Arc<GatewayState>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
@@ -3264,7 +3530,7 @@ async fn run_with_tools(
     provider: Arc<dyn moltis_agents::model::LlmProvider>,
     model_id: &str,
     tool_registry: &Arc<RwLock<ToolRegistry>>,
-    text: &str,
+    user_content: &UserContent,
     provider_name: &str,
     history_raw: &[serde_json::Value],
     session_key: &str,
@@ -3321,6 +3587,13 @@ async fn run_with_tools(
         )
     };
 
+    // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
+    let system_prompt = if desired_reply_medium == ReplyMedium::Voice {
+        format!("{system_prompt}{VOICE_REPLY_SUFFIX}")
+    } else {
+        system_prompt
+    };
+
     // Determine if this session is sandboxed (for browser tool execution mode)
     let session_is_sandboxed = if let Some(ref router) = state.sandbox_router {
         router.is_sandboxed(session_key).await
@@ -3328,23 +3601,22 @@ async fn run_with_tools(
         false
     };
 
-    // Broadcast tool events to the UI as they happen.
+    // Broadcast tool events to the UI in the order emitted by the runner.
     let state_for_events = Arc::clone(state);
     let run_id_for_events = run_id.to_string();
     let session_key_for_events = session_key.to_string();
     let session_store_for_events = session_store.map(Arc::clone);
-    // Track tool call arguments from ToolCallStart so we can persist them with ToolCallEnd.
-    let tool_args_map: Arc<std::sync::Mutex<HashMap<String, Value>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let on_event: Box<dyn Fn(RunnerEvent) + Send + Sync> = Box::new(move |event| {
-        let state = Arc::clone(&state_for_events);
-        let run_id = run_id_for_events.clone();
-        let sk = session_key_for_events.clone();
-        let store = session_store_for_events.clone();
-        let args_map = Arc::clone(&tool_args_map);
-        let seq = client_seq;
-        tokio::spawn(async move {
-            let payload = match &event {
+    let (on_event, mut event_rx) = ordered_runner_event_callback();
+    let event_forwarder = tokio::spawn(async move {
+        // Track tool call arguments from ToolCallStart so they can be persisted in ToolCallEnd.
+        let mut tool_args_map: HashMap<String, Value> = HashMap::new();
+        while let Some(event) = event_rx.recv().await {
+            let state = Arc::clone(&state_for_events);
+            let run_id = run_id_for_events.clone();
+            let sk = session_key_for_events.clone();
+            let store = session_store_for_events.clone();
+            let seq = client_seq;
+            let payload = match event {
                 RunnerEvent::Thinking => serde_json::json!({
                     "runId": run_id,
                     "sessionKey": sk,
@@ -3362,10 +3634,7 @@ async fn run_with_tools(
                     name,
                     arguments,
                 } => {
-                    // Track arguments for persistence in ToolCallEnd.
-                    if let Ok(mut map) = args_map.lock() {
-                        map.insert(id.clone(), arguments.clone());
-                    }
+                    tool_args_map.insert(id.clone(), arguments.clone());
 
                     // Send tool status to channels (Telegram, etc.)
                     let state_clone = Arc::clone(&state);
@@ -3382,6 +3651,7 @@ async fn run_with_tools(
                         .await;
                     });
 
+                    let is_browser = name == "browser";
                     let mut payload = serde_json::json!({
                         "runId": run_id,
                         "sessionKey": sk,
@@ -3391,8 +3661,7 @@ async fn run_with_tools(
                         "arguments": arguments,
                         "seq": seq,
                     });
-                    // Add execution mode for browser tool (follows session sandbox mode)
-                    if name == "browser" {
+                    if is_browser {
                         payload["executionMode"] = serde_json::json!(if session_is_sandboxed {
                             "sandbox"
                         } else {
@@ -3417,7 +3686,7 @@ async fn run_with_tools(
                         "success": success,
                         "seq": seq,
                     });
-                    if let Some(err) = error {
+                    if let Some(ref err) = error {
                         payload["error"] = serde_json::json!(parse_chat_error(err, None));
                     }
                     // Check for screenshot to send to channel (Telegram, etc.)
@@ -3428,7 +3697,19 @@ async fn run_with_tools(
                         .filter(|s| s.starts_with("data:image/"))
                         .map(String::from);
 
-                    if let Some(res) = result {
+                    // Extract location from show_map results for native pin
+                    let location_to_send = if name == "show_map" {
+                        result.as_ref().and_then(|r| {
+                            let lat = r.get("latitude")?.as_f64()?;
+                            let lon = r.get("longitude")?.as_f64()?;
+                            let label = r.get("label").and_then(|l| l.as_str()).map(String::from);
+                            Some((lat, lon, label))
+                        })
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref res) = result {
                         // Cap output sent to the UI to avoid huge WS frames.
                         let mut capped = res.clone();
                         for field in &["stdout", "stderr"] {
@@ -3446,7 +3727,23 @@ async fn run_with_tools(
                         payload["result"] = capped;
                     }
 
-                    // Send screenshot to channel targets (Telegram) if present
+                    // Send native location pin to channels before the screenshot.
+                    if let Some((lat, lon, label)) = location_to_send {
+                        let state_clone = Arc::clone(&state);
+                        let sk_clone = sk.clone();
+                        tokio::spawn(async move {
+                            send_location_to_channels(
+                                &state_clone,
+                                &sk_clone,
+                                lat,
+                                lon,
+                                label.as_deref(),
+                            )
+                            .await;
+                        });
+                    }
+
+                    // Send screenshot to channel targets (Telegram) if present.
                     if let Some(screenshot_data) = screenshot_to_send {
                         let state_clone = Arc::clone(&state);
                         let sk_clone = sk.clone();
@@ -3458,7 +3755,7 @@ async fn run_with_tools(
 
                     // Persist tool result to the session JSONL file.
                     if let Some(ref store) = store {
-                        let tracked_args = args_map.lock().ok().and_then(|mut m| m.remove(id));
+                        let tracked_args = tool_args_map.remove(&id);
                         // Save screenshot to media dir (if present) and replace
                         // with a lightweight path reference. Strip screenshot_scale
                         // (only needed for live rendering). Cap stdout/stderr at
@@ -3525,9 +3822,9 @@ async fn run_with_tools(
                             id,
                             name,
                             tracked_args,
-                            *success,
+                            success,
                             persisted_result,
-                            error.clone(),
+                            error,
                         );
                         let store_clone = Arc::clone(store);
                         let sk_persist = sk.clone();
@@ -3590,9 +3887,15 @@ async fn run_with_tools(
                     "toolCallsMade": tool_calls_made,
                     "seq": seq,
                 }),
+                RunnerEvent::RetryingAfterError(_) => serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": sk,
+                    "state": "retrying",
+                    "seq": seq,
+                }),
             };
             broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
-        });
+        }
     });
 
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
@@ -3622,7 +3925,7 @@ async fn run_with_tools(
         provider,
         &filtered_registry,
         &system_prompt,
-        text,
+        user_content,
         Some(&on_event),
         hist,
         Some(tool_context.clone()),
@@ -3633,7 +3936,7 @@ async fn run_with_tools(
     // On context-window overflow, compact the session and retry once.
     let result = match first_result {
         Err(AgentRunError::ContextWindowExceeded(ref msg)) if session_store.is_some() => {
-            let store = session_store.unwrap();
+            let store = session_store?;
             info!(
                 run_id,
                 session = session_key,
@@ -3685,7 +3988,7 @@ async fn run_with_tools(
                         provider_ref.clone(),
                         &filtered_registry,
                         &system_prompt,
-                        text,
+                        user_content,
                         Some(&on_event),
                         retry_hist,
                         Some(tool_context),
@@ -3715,6 +4018,13 @@ async fn run_with_tools(
         },
         other => other,
     };
+
+    // Ensure all runner events (including deltas) are broadcast in order before
+    // emitting terminal final/error frames.
+    drop(on_event);
+    if let Err(e) = event_forwarder.await {
+        warn!(run_id, error = %e, "runner event forwarder task failed");
+    }
 
     match result {
         Ok(result) => {
@@ -3771,13 +4081,9 @@ async fn run_with_tools(
                 audio: audio_path.clone(),
                 seq: client_seq,
             };
-            broadcast(
-                state,
-                "chat",
-                serde_json::to_value(&final_payload).unwrap(),
-                BroadcastOpts::default(),
-            )
-            .await;
+            #[allow(clippy::unwrap_used)] // serializing known-valid struct
+            let payload_val = serde_json::to_value(&final_payload).unwrap();
+            broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
             if !is_silent {
                 // Send push notification when chat response completes
@@ -3809,13 +4115,9 @@ async fn run_with_tools(
                 error: error_obj,
                 seq: client_seq,
             };
-            broadcast(
-                state,
-                "chat",
-                serde_json::to_value(&error_payload).unwrap(),
-                BroadcastOpts::default(),
-            )
-            .await;
+            #[allow(clippy::unwrap_used)] // serializing known-valid struct
+            let payload_val = serde_json::to_value(&error_payload).unwrap();
+            broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
             None
         },
     }
@@ -3835,22 +4137,16 @@ async fn compact_session(
         return Err("nothing to compact".into());
     }
 
-    let mut conversation_text = String::new();
-    for msg in &history {
-        let role = msg
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        conversation_text.push_str(&format!("{role}: {content}\n\n"));
-    }
-
-    let summary_messages = vec![
-        ChatMessage::system(
-            "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble.",
-        ),
-        ChatMessage::user(&conversation_text),
-    ];
+    // Use structured ChatMessage objects so role boundaries are maintained via
+    // the API's message structure, preventing prompt injection where user content
+    // could mimic role prefixes in concatenated text.
+    let mut summary_messages = vec![ChatMessage::system(
+        "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
+    )];
+    summary_messages.extend(values_to_chat_messages(&history));
+    summary_messages.push(ChatMessage::user(
+        "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
+    ));
 
     let mut stream = provider.stream(summary_messages);
     let mut summary = String::new();
@@ -3900,7 +4196,7 @@ async fn run_streaming(
     run_id: &str,
     provider: Arc<dyn moltis_agents::model::LlmProvider>,
     model_id: &str,
-    text: &str,
+    user_content: &UserContent,
     provider_name: &str,
     history_raw: &[serde_json::Value],
     session_key: &str,
@@ -3924,11 +4220,20 @@ async fn run_streaming(
         runtime_context,
     );
 
+    // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
+    let system_prompt = if desired_reply_medium == ReplyMedium::Voice {
+        format!("{system_prompt}{VOICE_REPLY_SUFFIX}")
+    } else {
+        system_prompt
+    };
+
     let mut messages: Vec<ChatMessage> = Vec::new();
     messages.push(ChatMessage::system(system_prompt));
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
     messages.extend(values_to_chat_messages(history_raw));
-    messages.push(ChatMessage::user(text));
+    messages.push(ChatMessage::User {
+        content: user_content.clone(),
+    });
 
     #[cfg(feature = "metrics")]
     let stream_start = Instant::now();
@@ -4049,13 +4354,9 @@ async fn run_streaming(
                     audio: audio_path.clone(),
                     seq: client_seq,
                 };
-                broadcast(
-                    state,
-                    "chat",
-                    serde_json::to_value(&final_payload).unwrap(),
-                    BroadcastOpts::default(),
-                )
-                .await;
+                #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                let payload_val = serde_json::to_value(&final_payload).unwrap();
+                broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
                 if !is_silent {
                     // Send push notification when chat response completes
@@ -4087,13 +4388,9 @@ async fn run_streaming(
                     error: error_obj,
                     seq: client_seq,
                 };
-                broadcast(
-                    state,
-                    "chat",
-                    serde_json::to_value(&error_payload).unwrap(),
-                    BroadcastOpts::default(),
-                )
-                .await;
+                #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                let payload_val = serde_json::to_value(&error_payload).unwrap();
+                broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
                 return None;
             },
             // Tool events not expected in stream-only mode.
@@ -4176,6 +4473,8 @@ async fn deliver_channel_replies(
         Some(o) => o,
         None => return,
     };
+    // Drain buffered status log entries to build a logbook suffix.
+    let status_log = state.drain_channel_status_log(session_key).await;
     deliver_channel_replies_to_targets(
         outbound,
         targets,
@@ -4183,8 +4482,28 @@ async fn deliver_channel_replies(
         text,
         Arc::clone(state),
         desired_reply_medium,
+        status_log,
     )
     .await;
+}
+
+/// Format buffered status log entries into a Telegram expandable blockquote HTML.
+/// Returns an empty string if there are no entries.
+fn format_logbook_html(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<blockquote expandable>\n\u{1f4cb} <b>Activity log</b>\n");
+    for entry in entries {
+        // Escape HTML entities in the entry text.
+        let escaped = entry
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        html.push_str(&format!("\u{2022} {escaped}\n"));
+    }
+    html.push_str("</blockquote>");
+    html
 }
 
 async fn deliver_channel_replies_to_targets(
@@ -4194,15 +4513,18 @@ async fn deliver_channel_replies_to_targets(
     text: &str,
     state: Arc<GatewayState>,
     desired_reply_medium: ReplyMedium,
+    status_log: Vec<String>,
 ) {
     let session_key = session_key.to_string();
     let text = text.to_string();
+    let logbook_html = format_logbook_html(&status_log);
     let mut tasks = Vec::with_capacity(targets.len());
     for target in targets {
         let outbound = Arc::clone(&outbound);
         let state = Arc::clone(&state);
         let session_key = session_key.clone();
         let text = text.clone();
+        let logbook_html = logbook_html.clone();
         tasks.push(tokio::spawn(async move {
             let tts_payload = match desired_reply_medium {
                 ReplyMedium::Voice => build_tts_payload(&state, &session_key, &target, &text).await,
@@ -4211,23 +4533,98 @@ async fn deliver_channel_replies_to_targets(
             let reply_to = target.message_id.as_deref();
             match target.channel_type {
                 moltis_channels::ChannelType::Telegram => match tts_payload {
-                    Some(payload) => {
-                        if let Err(e) = outbound
-                            .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
-                            .await
-                        {
-                            warn!(
-                                account_id = target.account_id,
-                                chat_id = target.chat_id,
-                                "failed to send channel voice reply: {e}"
-                            );
+                    Some(mut payload) => {
+                        let transcript = std::mem::take(&mut payload.text);
+
+                        // Short transcript fits as a caption on the voice message.
+                        if transcript.len() <= moltis_telegram::markdown::TELEGRAM_CAPTION_LIMIT {
+                            payload.text = transcript;
+                            if let Err(e) = outbound
+                                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                                .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send channel voice reply: {e}"
+                                );
+                            }
+                            // Send logbook as a follow-up if present.
+                            if !logbook_html.is_empty()
+                                && let Err(e) = outbound
+                                    .send_text(
+                                        &target.account_id,
+                                        &target.chat_id,
+                                        &logbook_html,
+                                        None,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send logbook follow-up: {e}"
+                                );
+                            }
+                        } else {
+                            // Transcript too long for a caption — send voice
+                            // without caption, then the full text as a follow-up.
+                            if let Err(e) = outbound
+                                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                                .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send channel voice reply: {e}"
+                                );
+                            }
+                            let text_result = if logbook_html.is_empty() {
+                                outbound
+                                    .send_text(
+                                        &target.account_id,
+                                        &target.chat_id,
+                                        &transcript,
+                                        None,
+                                    )
+                                    .await
+                            } else {
+                                outbound
+                                    .send_text_with_suffix(
+                                        &target.account_id,
+                                        &target.chat_id,
+                                        &transcript,
+                                        &logbook_html,
+                                        None,
+                                    )
+                                    .await
+                            };
+                            if let Err(e) = text_result {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send transcript follow-up: {e}"
+                                );
+                            }
                         }
                     },
                     None => {
-                        if let Err(e) = outbound
-                            .send_text(&target.account_id, &target.chat_id, &text, reply_to)
-                            .await
-                        {
+                        let result = if logbook_html.is_empty() {
+                            outbound
+                                .send_text(&target.account_id, &target.chat_id, &text, reply_to)
+                                .await
+                        } else {
+                            outbound
+                                .send_text_with_suffix(
+                                    &target.account_id,
+                                    &target.chat_id,
+                                    &text,
+                                    &logbook_html,
+                                    reply_to,
+                                )
+                                .await
+                        };
+                        if let Err(e) = result {
                             warn!(
                                 account_id = target.account_id,
                                 chat_id = target.chat_id,
@@ -4290,6 +4687,9 @@ async fn generate_tts_audio(
         return None;
     }
 
+    // Layer 2: strip markdown/URLs the LLM may have included despite the prompt.
+    let text = moltis_voice::tts::sanitize_text_for_tts(text);
+
     let session_override = {
         state
             .inner
@@ -4301,7 +4701,7 @@ async fn generate_tts_audio(
     };
 
     let request = TtsConvertRequest {
-        text,
+        text: &text,
         format: "ogg",
         provider: session_override.as_ref().and_then(|o| o.provider.clone()),
         voice_id: session_override.as_ref().and_then(|o| o.voice_id.clone()),
@@ -4335,6 +4735,10 @@ async fn build_tts_payload(
         return None;
     }
 
+    // Strip markdown/URLs the LLM may have included — use sanitized text
+    // only for TTS conversion, but keep the original for the caption.
+    let sanitized = moltis_voice::tts::sanitize_text_for_tts(text);
+
     let channel_key = format!("{}:{}", target.channel_type.as_str(), target.account_id);
     let (channel_override, session_override) = {
         let inner = state.inner.read().await;
@@ -4346,7 +4750,7 @@ async fn build_tts_payload(
     let resolved = channel_override.or(session_override);
 
     let request = TtsConvertRequest {
-        text,
+        text: &sanitized,
         format: "ogg",
         provider: resolved.as_ref().and_then(|o| o.provider.clone()),
         voice_id: resolved.as_ref().and_then(|o| o.voice_id.clone()),
@@ -4367,7 +4771,7 @@ async fn build_tts_payload(
         .unwrap_or_else(|| "audio/ogg".to_string());
 
     Some(ReplyPayload {
-        text: String::new(),
+        text: text.to_string(),
         media: Some(MediaAttachment {
             url: format!("data:{mime_type};base64,{}", response.audio),
             mime_type,
@@ -4377,8 +4781,9 @@ async fn build_tts_payload(
     })
 }
 
-/// Send a tool execution status to all pending channel targets for a session.
-/// Uses `peek_channel_replies` so targets remain for the final text response.
+/// Buffer a tool execution status into the channel status log for a session.
+/// The buffered entries are appended as a collapsible logbook when the final
+/// response is delivered, instead of being sent as separate messages.
 async fn send_tool_status_to_channels(
     state: &Arc<GatewayState>,
     session_key: &str,
@@ -4390,54 +4795,9 @@ async fn send_tool_status_to_channels(
         return;
     }
 
-    let outbound = match state.services.channel_outbound_arc() {
-        Some(o) => o,
-        None => return,
-    };
-
-    // Format a concise tool execution message
+    // Buffer the status message for the logbook
     let message = format_tool_status_message(tool_name, arguments);
-
-    for target in targets {
-        let outbound = Arc::clone(&outbound);
-        let message = message.clone();
-        tokio::spawn(async move {
-            // Send as a silent message to avoid notification spam
-            if let Err(e) = outbound
-                .send_text_silent(
-                    &target.account_id,
-                    &target.chat_id,
-                    &message,
-                    target.message_id.as_deref(),
-                )
-                .await
-            {
-                debug!(
-                    account_id = target.account_id,
-                    chat_id = target.chat_id,
-                    "failed to send tool status to channel: {e}"
-                );
-            } else {
-                // Re-send typing indicator after status message
-                // (sending a message clears the typing indicator in Telegram)
-                debug!(
-                    account_id = target.account_id,
-                    chat_id = target.chat_id,
-                    "sent tool status, re-sending typing indicator"
-                );
-                if let Err(e) = outbound
-                    .send_typing(&target.account_id, &target.chat_id)
-                    .await
-                {
-                    debug!(
-                        account_id = target.account_id,
-                        chat_id = target.chat_id,
-                        "failed to re-send typing after tool status: {e}"
-                    );
-                }
-            }
-        });
-    }
+    state.push_channel_status_log(session_key, message).await;
 }
 
 /// Format a human-readable tool execution message.
@@ -4603,6 +4963,67 @@ async fn send_screenshot_to_channels(
     }
 }
 
+/// Send a native location pin to all pending channel targets for a session.
+/// Uses `peek_channel_replies` so targets remain for the final text response.
+async fn send_location_to_channels(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    latitude: f64,
+    longitude: f64,
+    title: Option<&str>,
+) {
+    let targets = state.peek_channel_replies(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let outbound = match state.services.channel_outbound_arc() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let title_owned = title.map(String::from);
+
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let title_ref = title_owned.clone();
+        tasks.push(tokio::spawn(async move {
+            let reply_to = target.message_id.as_deref();
+            if let Err(e) = outbound
+                .send_location(
+                    &target.account_id,
+                    &target.chat_id,
+                    latitude,
+                    longitude,
+                    title_ref.as_deref(),
+                    reply_to,
+                )
+                .await
+            {
+                warn!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    "failed to send location to channel: {e}"
+                );
+            } else {
+                debug!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    "sent location pin to telegram"
+                );
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel location task join failed");
+        }
+    }
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use {
@@ -4736,6 +5157,7 @@ mod tests {
             "hello",
             state,
             ReplyMedium::Text,
+            Vec::new(),
         )
         .await;
 
@@ -4744,6 +5166,32 @@ mod tests {
             "delivery should wait for outbound send completion"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ordered_runner_event_callback_stays_in_order_with_variable_processing_latency() {
+        let (on_event, mut rx) = ordered_runner_event_callback();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen_for_worker = Arc::clone(&seen);
+
+        let worker = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let RunnerEvent::TextDelta(text) = event {
+                    if text == "slow" {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    seen_for_worker.lock().await.push(text);
+                }
+            }
+        });
+
+        on_event(RunnerEvent::TextDelta("slow".to_string()));
+        on_event(RunnerEvent::TextDelta("fast".to_string()));
+        drop(on_event);
+
+        worker.await.unwrap();
+        let observed = seen.lock().await.clone();
+        assert_eq!(observed, vec!["slow".to_string(), "fast".to_string()]);
     }
 
     /// Build a bare session_locks map for testing the semaphore logic
@@ -5201,6 +5649,7 @@ mod tests {
             ))),
             Arc::new(RwLock::new(DisabledModelsStore::default())),
             vec!["gpt-5.2".into(), "claude-opus-4-5".into()],
+            vec![],
         );
 
         let m1 = moltis_agents::providers::ModelInfo {
@@ -5223,6 +5672,246 @@ mod tests {
         assert_eq!(ordered[0].id, m1.id);
         assert_eq!(ordered[1].id, m2.id);
         assert_eq!(ordered[2].id, m3.id);
+    }
+
+    #[test]
+    fn priority_models_match_separator_variants() {
+        let service = LiveModelService::new(
+            Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+                &moltis_config::schema::ProvidersConfig::default(),
+            ))),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            vec!["gpt 5.2".into(), "claude-sonnet-4.5".into()],
+            vec![],
+        );
+
+        let m1 = moltis_agents::providers::ModelInfo {
+            id: "openai-codex::gpt-5.2".into(),
+            provider: "openai-codex".into(),
+            display_name: "GPT-5.2".into(),
+        };
+        let m2 = moltis_agents::providers::ModelInfo {
+            id: "anthropic::claude-sonnet-4-5-20250929".into(),
+            provider: "anthropic".into(),
+            display_name: "Claude Sonnet 4.5".into(),
+        };
+        let m3 = moltis_agents::providers::ModelInfo {
+            id: "google::gemini-3-flash".into(),
+            provider: "gemini".into(),
+            display_name: "Gemini 3 Flash".into(),
+        };
+
+        let ordered = service.prioritize_models(vec![&m3, &m2, &m1].into_iter());
+        assert_eq!(ordered[0].id, m1.id);
+        assert_eq!(ordered[1].id, m2.id);
+        assert_eq!(ordered[2].id, m3.id);
+    }
+
+    #[test]
+    fn allowed_models_filters_by_substring_match() {
+        let m1 = moltis_agents::providers::ModelInfo {
+            id: "anthropic::claude-opus-4-5".into(),
+            provider: "anthropic".into(),
+            display_name: "Claude Opus 4.5".into(),
+        };
+        let m2 = moltis_agents::providers::ModelInfo {
+            id: "openai-codex::gpt-5.2".into(),
+            provider: "openai-codex".into(),
+            display_name: "GPT 5.2".into(),
+        };
+        let m3 = moltis_agents::providers::ModelInfo {
+            id: "google::gemini-3-flash".into(),
+            provider: "google".into(),
+            display_name: "Gemini 3 Flash".into(),
+        };
+
+        let patterns: Vec<String> = vec!["opus".into()];
+        assert!(model_matches_allowlist(&m1, &patterns));
+        assert!(!model_matches_allowlist(&m2, &patterns));
+        assert!(!model_matches_allowlist(&m3, &patterns));
+    }
+
+    #[test]
+    fn allowed_models_empty_shows_all() {
+        let m = moltis_agents::providers::ModelInfo {
+            id: "anthropic::claude-opus-4-5".into(),
+            provider: "anthropic".into(),
+            display_name: "Claude Opus 4.5".into(),
+        };
+        assert!(model_matches_allowlist(&m, &[]));
+    }
+
+    #[test]
+    fn allowed_models_case_insensitive() {
+        let m = moltis_agents::providers::ModelInfo {
+            id: "anthropic::claude-opus-4-5".into(),
+            provider: "anthropic".into(),
+            display_name: "Claude Opus 4.5".into(),
+        };
+
+        // Uppercase pattern matches lowercase model key.
+        let patterns = vec![normalize_model_key("OPUS")];
+        assert!(model_matches_allowlist(&m, &patterns));
+
+        // Mixed case.
+        let patterns = vec![normalize_model_key("OpUs")];
+        assert!(model_matches_allowlist(&m, &patterns));
+    }
+
+    #[test]
+    fn allowed_models_match_separator_variants() {
+        let m = moltis_agents::providers::ModelInfo {
+            id: "openai-codex::gpt-5.2".into(),
+            provider: "openai-codex".into(),
+            display_name: "GPT-5.2".into(),
+        };
+
+        let patterns = vec![normalize_model_key("gpt 5.2")];
+        assert!(model_matches_allowlist(&m, &patterns));
+
+        let patterns = vec![normalize_model_key("gpt-5-2")];
+        assert!(model_matches_allowlist(&m, &patterns));
+    }
+
+    #[test]
+    fn allowed_models_does_not_filter_local_llm_or_ollama() {
+        let local = moltis_agents::providers::ModelInfo {
+            id: "local-llm::qwen2.5-coder-7b-q4_k_m".into(),
+            provider: "local-llm".into(),
+            display_name: "Qwen2.5 Coder 7B".into(),
+        };
+        let ollama = moltis_agents::providers::ModelInfo {
+            id: "ollama::llama3.1:8b".into(),
+            provider: "ollama".into(),
+            display_name: "Llama 3.1 8B".into(),
+        };
+        let patterns = vec![normalize_model_key("opus")];
+
+        assert!(model_matches_allowlist(&local, &patterns));
+        assert!(model_matches_allowlist(&ollama, &patterns));
+    }
+
+    #[test]
+    fn allowed_models_does_not_filter_ollama_when_provider_is_aliased() {
+        let aliased = moltis_agents::providers::ModelInfo {
+            id: "local-ai::llama3.1:8b".into(),
+            provider: "local-ai".into(),
+            display_name: "Llama 3.1 8B".into(),
+        };
+        let patterns = vec![normalize_model_key("opus")];
+
+        assert!(model_matches_allowlist_with_provider(
+            &aliased,
+            Some("ollama"),
+            &patterns
+        ));
+    }
+
+    #[tokio::test]
+    async fn allowed_models_filters_list_and_list_all() {
+        let mut registry = ProviderRegistry::from_env_with_config(
+            &moltis_config::schema::ProvidersConfig::default(),
+        );
+        registry.register(
+            moltis_agents::providers::ModelInfo {
+                id: "anthropic::claude-opus-4-5".to_string(),
+                provider: "anthropic".to_string(),
+                display_name: "Claude Opus 4.5".to_string(),
+            },
+            Arc::new(StaticProvider {
+                name: "anthropic".to_string(),
+                id: "anthropic::claude-opus-4-5".to_string(),
+            }),
+        );
+        registry.register(
+            moltis_agents::providers::ModelInfo {
+                id: "openai-codex::gpt-5.2".to_string(),
+                provider: "openai-codex".to_string(),
+                display_name: "GPT 5.2".to_string(),
+            },
+            Arc::new(StaticProvider {
+                name: "openai-codex".to_string(),
+                id: "openai-codex::gpt-5.2".to_string(),
+            }),
+        );
+        registry.register(
+            moltis_agents::providers::ModelInfo {
+                id: "google::gemini-3-flash".to_string(),
+                provider: "google".to_string(),
+                display_name: "Gemini 3 Flash".to_string(),
+            },
+            Arc::new(StaticProvider {
+                name: "google".to_string(),
+                id: "google::gemini-3-flash".to_string(),
+            }),
+        );
+
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+        let service = LiveModelService::new(
+            Arc::new(RwLock::new(registry)),
+            disabled,
+            vec![],
+            vec!["opus".into()],
+        );
+
+        // list() should only contain opus.
+        let result = service.list().await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "anthropic::claude-opus-4-5");
+
+        // list_all() should also only contain opus.
+        let result = service.list_all().await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "anthropic::claude-opus-4-5");
+    }
+
+    #[tokio::test]
+    async fn allowed_models_keeps_ollama_when_provider_is_aliased() {
+        let mut registry = ProviderRegistry::from_env_with_config(
+            &moltis_config::schema::ProvidersConfig::default(),
+        );
+        registry.register(
+            moltis_agents::providers::ModelInfo {
+                id: "openai-codex::gpt-5.2".to_string(),
+                provider: "openai-codex".to_string(),
+                display_name: "GPT 5.2".to_string(),
+            },
+            Arc::new(StaticProvider {
+                name: "openai-codex".to_string(),
+                id: "openai-codex::gpt-5.2".to_string(),
+            }),
+        );
+        registry.register(
+            moltis_agents::providers::ModelInfo {
+                id: "local-ai::llama3.1:8b".to_string(),
+                provider: "local-ai".to_string(),
+                display_name: "Llama 3.1 8B".to_string(),
+            },
+            Arc::new(StaticProvider {
+                name: "ollama".to_string(),
+                id: "local-ai::llama3.1:8b".to_string(),
+            }),
+        );
+
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+        let service = LiveModelService::new(
+            Arc::new(RwLock::new(registry)),
+            disabled,
+            vec![],
+            vec!["opus".into()],
+        );
+
+        let result = service.list().await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "local-ai::llama3.1:8b");
+
+        let result = service.list_all().await.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "local-ai::llama3.1:8b");
     }
 
     #[test]
@@ -5252,6 +5941,41 @@ mod tests {
         assert!(provider_matches_filter("github-copilot", None));
     }
 
+    #[test]
+    fn push_provider_model_groups_models_by_provider() {
+        let mut grouped: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        push_provider_model(
+            &mut grouped,
+            "openai-codex",
+            "openai-codex::gpt-5.2",
+            "GPT-5.2",
+        );
+        push_provider_model(
+            &mut grouped,
+            "openai-codex",
+            "openai-codex::gpt-5.1-codex-mini",
+            "GPT-5.1 Codex Mini",
+        );
+        push_provider_model(
+            &mut grouped,
+            "anthropic",
+            "anthropic::claude-sonnet-4-5-20250929",
+            "Claude Sonnet 4.5",
+        );
+
+        let openai = grouped.get("openai-codex").expect("openai group exists");
+        assert_eq!(openai.len(), 2);
+        assert_eq!(openai[0]["modelId"], "openai-codex::gpt-5.2");
+        assert_eq!(openai[1]["modelId"], "openai-codex::gpt-5.1-codex-mini");
+
+        let anthropic = grouped.get("anthropic").expect("anthropic group exists");
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(
+            anthropic[0]["modelId"],
+            "anthropic::claude-sonnet-4-5-20250929"
+        );
+    }
+
     #[tokio::test]
     async fn list_all_includes_disabled_models_and_list_hides_them() {
         let mut registry = ProviderRegistry::from_env_with_config(
@@ -5275,7 +5999,8 @@ mod tests {
             store.disable("unit-test-provider::unit-test-model");
         }
 
-        let service = LiveModelService::new(Arc::new(RwLock::new(registry)), disabled, vec![]);
+        let service =
+            LiveModelService::new(Arc::new(RwLock::new(registry)), disabled, vec![], vec![]);
 
         let all = service
             .list_all()
@@ -5324,6 +6049,69 @@ mod tests {
         assert_eq!(next_probe_rate_limit_backoff_ms(Some(30_000)), 30_000);
     }
 
+    #[tokio::test]
+    async fn model_test_rejects_missing_model_id() {
+        let service = LiveModelService::new(
+            Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+                &moltis_config::schema::ProvidersConfig::default(),
+            ))),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            vec![],
+            vec![],
+        );
+        let result = service.test(serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'modelId'"));
+    }
+
+    #[tokio::test]
+    async fn model_test_rejects_unknown_model() {
+        let service = LiveModelService::new(
+            Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+                &moltis_config::schema::ProvidersConfig::default(),
+            ))),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            vec![],
+            vec![],
+        );
+        let result = service
+            .test(serde_json::json!({"modelId": "nonexistent::model-xyz"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown model"));
+    }
+
+    #[tokio::test]
+    async fn model_test_returns_error_when_provider_fails() {
+        let mut registry = ProviderRegistry::from_env_with_config(
+            &moltis_config::schema::ProvidersConfig::default(),
+        );
+        // StaticProvider's complete() returns an error ("not implemented for test")
+        registry.register(
+            moltis_agents::providers::ModelInfo {
+                id: "test-provider::test-model".to_string(),
+                provider: "test-provider".to_string(),
+                display_name: "Test Model".to_string(),
+            },
+            Arc::new(StaticProvider {
+                name: "test-provider".to_string(),
+                id: "test-provider::test-model".to_string(),
+            }),
+        );
+
+        let service = LiveModelService::new(
+            Arc::new(RwLock::new(registry)),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            vec![],
+            vec![],
+        );
+        let result = service
+            .test(serde_json::json!({"modelId": "test-provider::test-model"}))
+            .await;
+        // StaticProvider.complete() returns Err, so test should return an error.
+        assert!(result.is_err());
+    }
+
     #[test]
     fn probe_parallel_per_provider_defaults_and_clamps() {
         assert_eq!(probe_max_parallel_per_provider(&serde_json::json!({})), 1);
@@ -5335,5 +6123,197 @@ mod tests {
             probe_max_parallel_per_provider(&serde_json::json!({"maxParallelPerProvider": 99})),
             8
         );
+    }
+
+    // ── to_user_content tests ─────────────────────────────────────────
+
+    #[test]
+    fn to_user_content_text_only() {
+        let mc = MessageContent::Text("hello".to_string());
+        let uc = to_user_content(&mc);
+        match uc {
+            UserContent::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn to_user_content_multimodal_with_image() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let mc = MessageContent::Multimodal(vec![
+            ContentBlock::Text {
+                text: "describe this".to_string(),
+            },
+            ContentBlock::ImageUrl {
+                image_url: SessionImageUrl {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                },
+            },
+        ]);
+        let uc = to_user_content(&mc);
+        match uc {
+            UserContent::Multimodal(parts) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    ContentPart::Text(t) => assert_eq!(t, "describe this"),
+                    _ => panic!("expected Text part"),
+                }
+                match &parts[1] {
+                    ContentPart::Image { media_type, data } => {
+                        assert_eq!(media_type, "image/png");
+                        assert_eq!(data, "AAAA");
+                    },
+                    _ => panic!("expected Image part"),
+                }
+            },
+            _ => panic!("expected Multimodal variant"),
+        }
+    }
+
+    #[test]
+    fn to_user_content_drops_invalid_data_uri() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let mc = MessageContent::Multimodal(vec![
+            ContentBlock::Text {
+                text: "just text".to_string(),
+            },
+            ContentBlock::ImageUrl {
+                image_url: SessionImageUrl {
+                    url: "https://example.com/image.png".to_string(),
+                },
+            },
+        ]);
+        let uc = to_user_content(&mc);
+        match uc {
+            UserContent::Multimodal(parts) => {
+                // The https URL is not a data URI, so it should be dropped
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    ContentPart::Text(t) => assert_eq!(t, "just text"),
+                    _ => panic!("expected Text part"),
+                }
+            },
+            _ => panic!("expected Multimodal variant"),
+        }
+    }
+
+    // ── Logbook formatting tests ─────────────────────────────────────────
+
+    #[test]
+    fn format_logbook_html_empty_entries() {
+        assert_eq!(format_logbook_html(&[]), "");
+    }
+
+    #[test]
+    fn format_logbook_html_single_entry() {
+        let entries = vec!["Using Claude Sonnet 4.5. Use /model to change.".to_string()];
+        let html = format_logbook_html(&entries);
+        assert!(html.starts_with("<blockquote expandable>"));
+        assert!(html.ends_with("</blockquote>"));
+        assert!(html.contains("\u{1f4cb} <b>Activity log</b>"));
+        assert!(html.contains("\u{2022} Using Claude Sonnet 4.5. Use /model to change."));
+    }
+
+    #[test]
+    fn format_logbook_html_multiple_entries() {
+        let entries = vec![
+            "Using Claude Sonnet 4.5. Use /model to change.".to_string(),
+            "\u{1f50d} Searching: rust async patterns".to_string(),
+            "\u{1f4bb} Running: `ls -la`".to_string(),
+        ];
+        let html = format_logbook_html(&entries);
+        // Verify all entries are present as bullet points.
+        for entry in &entries {
+            let escaped = entry
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            assert!(
+                html.contains(&format!("\u{2022} {escaped}")),
+                "missing entry: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_logbook_html_escapes_html_entities() {
+        let entries = vec!["Running: `echo <script>alert(1)</script>`".to_string()];
+        let html = format_logbook_html(&entries);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn extract_location_from_show_map_result() {
+        let result = serde_json::json!({
+            "latitude": 37.76,
+            "longitude": -122.42,
+            "label": "La Taqueria",
+            "screenshot": "data:image/png;base64,abc",
+            "map_links": {}
+        });
+
+        // Extraction logic mirrors the ToolCallEnd handler
+        let extracted = result
+            .get("latitude")
+            .and_then(|v| v.as_f64())
+            .and_then(|lat| {
+                let lon = result.get("longitude")?.as_f64()?;
+                let label = result
+                    .get("label")
+                    .and_then(|l| l.as_str())
+                    .map(String::from);
+                Some((lat, lon, label))
+            });
+
+        let (lat, lon, label) = extracted.unwrap();
+        assert!((lat - 37.76).abs() < f64::EPSILON);
+        assert!((lon - (-122.42)).abs() < f64::EPSILON);
+        assert_eq!(label.as_deref(), Some("La Taqueria"));
+    }
+
+    #[test]
+    fn extract_location_without_label() {
+        let result = serde_json::json!({
+            "latitude": 48.8566,
+            "longitude": 2.3522,
+            "screenshot": "data:image/png;base64,abc"
+        });
+
+        let extracted = result
+            .get("latitude")
+            .and_then(|v| v.as_f64())
+            .and_then(|lat| {
+                let lon = result.get("longitude")?.as_f64()?;
+                let label = result
+                    .get("label")
+                    .and_then(|l| l.as_str())
+                    .map(String::from);
+                Some((lat, lon, label))
+            });
+
+        let (lat, lon, label) = extracted.unwrap();
+        assert!((lat - 48.8566).abs() < f64::EPSILON);
+        assert!((lon - 2.3522).abs() < f64::EPSILON);
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn extract_location_missing_coords_returns_none() {
+        let result = serde_json::json!({
+            "screenshot": "data:image/png;base64,abc"
+        });
+
+        let extracted = result
+            .get("latitude")
+            .and_then(|v| v.as_f64())
+            .and_then(|_lat| {
+                let _lon = result.get("longitude")?.as_f64()?;
+                Some(())
+            });
+
+        assert!(extracted.is_none());
     }
 }

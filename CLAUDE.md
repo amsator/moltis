@@ -1,11 +1,12 @@
 ---
-description: "Git workflow standards: proper commit messages, pre-commit checks, and git worktree usage for independent feature work"
+description: "Moltis engineering guide for Claude/Codex agents: Rust architecture, testing, security, and release workflows"
 alwaysApply: true
 ---
 
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) and agents when
+working with code in this repository.
 
 ## General
 
@@ -157,7 +158,30 @@ logging, or display. Keep the core logic type-safe.
 
 - Use `anyhow::Result` for application-level errors and `thiserror` for
   library-level errors that callers need to match on.
-- Propagate errors with `?`; avoid `.unwrap()` outside of tests.
+- Propagate errors with `?`.
+- **Never use `.unwrap()` or `.expect()` in production code.** The workspace
+  lints enforce this via `clippy::unwrap_used` and `clippy::expect_used` set
+  to `deny`. Tests are exempt (use `#[allow(clippy::unwrap_used)]` on test
+  modules). Instead of unwrapping, use one of these alternatives:
+
+  ```rust
+  // Propagate with ?
+  let value = something.ok_or_else(|| anyhow::anyhow!("missing value"))?;
+
+  // Mutex/RwLock — recover from poisoning
+  let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+  // Pattern match
+  if let Some(v) = optional { /* use v */ }
+
+  // Provide a default
+  let v = optional.unwrap_or_default();
+  ```
+
+  The only acceptable uses of `.expect()` are at process startup for
+  resources that are fundamentally required (e.g. database migrations,
+  TLS config). These must have descriptive messages explaining why the
+  panic is intentional.
 
 ### Date, time, and crate reuse
 
@@ -197,6 +221,30 @@ whichever is already imported in the crate you're editing, but default to
 `time` for new code since it's lighter.
 
 ### General style
+
+- **Prefer guard clauses (early returns)** over nested `if` blocks. Check
+  for edge cases at the top of a function or block and `return` immediately,
+  then continue with the main logic at the top indentation level. This
+  reduces nesting and makes the happy path easier to follow.
+
+  ```rust
+  // Good — guard clause, flat structure
+  if items.is_empty() {
+      return;
+  }
+  info!(count = items.len(), "processing items");
+  for item in items { /* ... */ }
+
+  // Bad — unnecessary nesting
+  if !items.is_empty() {
+      info!(count = items.len(), "processing items");
+      for item in items { /* ... */ }
+  }
+  ```
+
+  Apply this to all control flow: `return`, `return Ok(...)`, `continue`,
+  `break`. When a function has multiple preconditions, stack the guards at
+  the top so the reader hits the happy path quickly.
 
 - Prefer iterators and combinators (`.map()`, `.filter()`, `.collect()`)
   over manual loops when they express intent more clearly.
@@ -505,11 +553,50 @@ cargo test <module>::               # Run all tests in a module
 cargo test -- --nocapture            # Run tests with stdout visible
 ```
 
+### E2E Tests (Web UI)
+
+**Every change to the web UI must have a matching E2E test.** This applies to:
+
+- **JavaScript changes** — new features, event handlers, state management,
+  WebSocket behavior, RPC calls.
+- **HTML changes** — new pages, layout changes, element additions/removals,
+  form inputs, navigation.
+- **CSS/Tailwind changes** — theme behavior, dark mode, visibility toggles,
+  responsive layout. Test that the right classes are applied and elements
+  are visible/hidden as expected.
+- **Feature completeness** — when adding a full feature (new settings page,
+  new wizard step, etc.), write E2E tests that exercise the entire user flow,
+  not just that the page loads.
+
+E2E tests live in `crates/gateway/ui/e2e/specs/` and use Playwright. Shared
+helpers are in `crates/gateway/ui/e2e/helpers.js`.
+
+```bash
+cd crates/gateway/ui
+npx playwright test                  # Run all E2E tests
+npx playwright test e2e/specs/chat-input.spec.js  # Run a specific spec
+npx playwright test --headed         # Run with visible browser
+```
+
+**Writing E2E tests:**
+
+- Use specific selectors — `getByRole()`, `getByPlaceholder()`, `getByText()`
+  with `{ exact: true }` — over loose CSS selectors or regex patterns.
+- Use the shared helpers (`navigateAndWait`, `waitForWsConnected`,
+  `expectPageContentMounted`, `watchPageErrors`) for consistency.
+- Always assert no JS errors: `const pageErrors = watchPageErrors(page);`
+  at the start, `expect(pageErrors).toEqual([]);` at the end.
+- Avoid `waitForTimeout()` — prefer Playwright's built-in auto-waiting
+  (`toBeVisible()`, `toHaveURL()`, `expect.poll()`).
+- Place new tests in the appropriate existing spec file, or create a new
+  spec file if the feature maps to a new page/domain.
+
 ## Code Quality
 
 ```bash
-cargo +nightly fmt       # Format code (uses nightly)
-cargo +nightly clippy    # Run linter (uses nightly)
+just format              # Format Rust with pinned nightly toolchain
+just format-check        # Exact format check used by CI/release
+just release-preflight   # Rust pre-release gates (fmt + clippy)
 cargo check              # Fast compile check without producing binary
 taplo fmt                # Format TOML files (Cargo.toml, etc.)
 biome check --write      # Lint & format JavaScript files (installed via mise)
@@ -553,6 +640,28 @@ functions in `sandbox.rs`, parameterised by CLI binary name. The
 `SandboxConfig::from(&config_schema::SandboxConfig)` impl converts the
 config-crate types to tools-crate types — use it instead of manual
 field-by-field conversion.
+
+## Logging Levels
+
+In production, the `debug` level is **never enabled** by default. Any log
+that needs to be visible for diagnosing issues must use `info!` or `warn!`,
+not `debug!`.
+
+- **`error!`** — unrecoverable failures (process will stop or feature is broken).
+- **`warn!`** — unexpected conditions that the system can recover from, but
+  an operator should investigate (e.g. auth failures, network errors, corrupt
+  data).
+- **`info!`** — normal operational milestones (startup, config loaded, tokens
+  saved). Keep these concise — one or two per major operation.
+- **`debug!`** — detailed diagnostic info (request/response bodies, internal
+  state). Expected "not configured" states belong here, **not** at `warn!`.
+- **`trace!`** — very verbose per-item data (token-by-token output, every SSE
+  line).
+
+**Common mistake:** logging `warn!` when a provider simply isn't configured
+(tokens not found, OAuth not set up). This floods the log on every startup
+for users who only use one or two providers. Use `debug!` for these expected
+conditions and reserve `warn!` for genuine failures.
 
 ## Security
 
@@ -855,8 +964,8 @@ concrete (commands to run, UI paths to click, and expected results).
 - [ ] **No secrets or private tokens are included** (CRITICAL)
 - [ ] `taplo fmt` (when TOML files were modified)
 - [ ] `biome check --write` (when JS files were modified; CI runs `biome ci`)
-- [ ] Code is formatted (`cargo +nightly fmt --all` / `just format-check` passes)
-- [ ] Code passes clippy linting (`cargo +nightly clippy --workspace --all-targets --all-features` / `just lint` passes)
+- [ ] Code is formatted (`just format-check` passes)
+- [ ] Code passes release clippy gate (`just release-preflight` passes)
 - [ ] All tests pass (`cargo test`)
 - [ ] Commit message follows conventional commit format
 - [ ] Changes are logically grouped in the commit
@@ -911,3 +1020,42 @@ Be careful about this.
 Helpful suggestion.
 \`\`\`
 ```
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+
+## Issue Tracking
+
+This project uses **bd (beads)** for issue tracking.
+Run `bd prime` for workflow context, or install hooks (`bd hooks install`) for auto-injection.
+
+**Quick reference:**
+- `bd ready` - Find unblocked work
+- `bd create "Title" --type task --priority 2` - Create issue
+- `bd close <id>` - Complete work
+- `bd sync` - Sync with git (run at session end)
+
+For full workflow details: `bd prime`

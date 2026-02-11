@@ -1,4 +1,4 @@
-// ── Providers page (Preact + HTM + Signals) ─────────────────
+// ── LLMs page (Preact + HTM + Signals) ──────────────────────
 
 import { signal } from "@preact/signals";
 import { html } from "htm/preact";
@@ -8,13 +8,13 @@ import { onEvent } from "./events.js";
 import { sendRpc } from "./helpers.js";
 import { fetchModels } from "./models.js";
 import { updateNavCount } from "./nav-counts.js";
-import { openProviderModal } from "./providers.js";
-import { registerPage } from "./router.js";
+import { openModelSelectorForProvider, openProviderModal } from "./providers.js";
 import { connected } from "./signals.js";
 import * as S from "./state.js";
 import { ConfirmDialog, requestConfirm } from "./ui.js";
 
 var configuredModels = signal([]);
+var providerMetaSig = signal(new Map());
 var loading = signal(false);
 var detectingModels = signal(false);
 var detectSummary = signal(null);
@@ -84,6 +84,7 @@ function fetchProviders() {
 					providerMeta.set(providerMetaEntry.name, providerMetaEntry);
 				}
 			}
+			providerMetaSig.value = providerMeta;
 
 			var models = [];
 			if (modelsRes?.ok) {
@@ -152,7 +153,7 @@ async function runDetectAllModels() {
 	}
 }
 
-function groupProviderRows(models) {
+function groupProviderRows(models, metaMap) {
 	var groups = new Map();
 	for (var row of models) {
 		var key = row.provider;
@@ -161,6 +162,7 @@ function groupProviderRows(models) {
 				provider: key,
 				providerDisplayName: row.providerDisplayName || row.displayName || key,
 				authType: row.authType || "api-key",
+				selectedModel: metaMap?.get(key)?.model || null,
 				models: [],
 			});
 		}
@@ -227,6 +229,12 @@ function ProviderSection(props) {
 		});
 	}
 
+	var hasModelsNoSelection = group.models.length > 0 && !group.selectedModel;
+
+	function onSelectModel() {
+		openModelSelectorForProvider(group.provider, group.providerDisplayName);
+	}
+
 	return html`<div class="max-w-form py-1">
 		<div class="flex items-center justify-between gap-3">
 			<div class="flex items-center gap-2 min-w-0">
@@ -235,7 +243,8 @@ function ProviderSection(props) {
 					${group.authType === "oauth" ? "OAuth" : group.authType === "local" ? "Local" : "API Key"}
 				</span>
 			</div>
-			<div class="shrink-0">
+			<div class="flex gap-2 shrink-0">
+				${hasModelsNoSelection ? html`<button class="provider-btn provider-btn-sm" onClick=${onSelectModel}>Select Model</button>` : null}
 				<button
 					class="provider-btn provider-btn-danger provider-btn-sm"
 					disabled=${deletingProvider.value === group.provider}
@@ -255,7 +264,7 @@ function ProviderSection(props) {
 							<div class="min-w-0 flex-1">
 								<div class="flex items-center gap-2 min-w-0">
 									<div class="text-sm font-medium text-[var(--text-strong)] truncate">${model.displayName || model.id}</div>
-									${model.unsupported ? html`<span class="provider-item-badge warning" title=${model.unsupportedReason || "Model is not supported for this account/provider"}>Unsupported</span>` : null}
+									${model.unsupported ? html`<span class="provider-item-badge warning" title=${model.unsupportedReason || "Model is not supported for this account"}>Unsupported</span>` : null}
 									${model.supportsTools ? null : html`<span class="provider-item-badge warning">Chat only</span>`}
 									${model.disabled ? html`<span class="provider-item-badge muted">Disabled</span>` : null}
 								</div>
@@ -290,14 +299,14 @@ function ProvidersPage() {
 	return html`
 		<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
 				<div class="flex items-center gap-3">
-					<h2 class="text-lg font-medium text-[var(--text-strong)]">Providers</h2>
+					<h2 class="text-lg font-medium text-[var(--text-strong)]">LLMs</h2>
 					<button
 						class="provider-btn"
 						onClick=${() => {
 							if (connected.value) openProviderModal();
 						}}
 					>
-						Add Provider
+						Add LLM
 					</button>
 					<button
 						class="provider-btn provider-btn-secondary"
@@ -340,9 +349,9 @@ function ProvidersPage() {
 					loading.value && configuredModels.value.length === 0
 						? html`<div class="text-xs text-[var(--muted)]">Loading…</div>`
 						: configuredModels.value.length === 0
-							? html`<div class="text-xs text-[var(--muted)]" style="padding:12px 0;">No providers configured yet.</div>`
+							? html`<div class="text-xs text-[var(--muted)]" style="padding:12px 0;">No LLM providers configured yet.</div>`
 							: html`<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;">
-								${groupProviderRows(configuredModels.value).map((g) => html`<${ProviderSection} key=${g.provider} group=${g} />`)}
+								${groupProviderRows(configuredModels.value, providerMetaSig.value).map((g) => html`<${ProviderSection} key=${g.provider} group=${g} />`)}
 							</div>`
 				}
 
@@ -352,15 +361,16 @@ function ProvidersPage() {
 		`;
 }
 
-registerPage(
-	"/providers",
-	function initProviders(container) {
-		container.style.cssText = "flex-direction:column;padding:0;overflow:hidden;";
-		render(html`<${ProvidersPage} />`, container);
-	},
-	function teardownProviders() {
-		S.setRefreshProvidersPage(null);
-		var container = S.$("pageContent");
-		if (container) render(null, container);
-	},
-);
+var _providersContainer = null;
+
+export function initProviders(container) {
+	_providersContainer = container;
+	container.style.cssText = "flex-direction:column;padding:0;overflow:hidden;";
+	render(html`<${ProvidersPage} />`, container);
+}
+
+export function teardownProviders() {
+	S.setRefreshProvidersPage(null);
+	if (_providersContainer) render(null, _providersContainer);
+	_providersContainer = null;
+}

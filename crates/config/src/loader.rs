@@ -34,31 +34,41 @@ static DATA_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Can be called multiple times (e.g. in tests) — each call replaces the
 /// previous override.
 pub fn set_config_dir(path: PathBuf) {
-    *CONFIG_DIR_OVERRIDE.lock().unwrap() = Some(path);
+    *CONFIG_DIR_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(path);
 }
 
 /// Clear the config directory override, restoring default discovery.
 pub fn clear_config_dir() {
-    *CONFIG_DIR_OVERRIDE.lock().unwrap() = None;
+    *CONFIG_DIR_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn config_dir_override() -> Option<PathBuf> {
-    CONFIG_DIR_OVERRIDE.lock().unwrap().clone()
+    CONFIG_DIR_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Set a custom data directory. When set, `data_dir()` returns this path
 /// instead of the default.
 pub fn set_data_dir(path: PathBuf) {
-    *DATA_DIR_OVERRIDE.lock().unwrap() = Some(path);
+    *DATA_DIR_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
 }
 
 /// Clear the data directory override, restoring default discovery.
 pub fn clear_data_dir() {
-    *DATA_DIR_OVERRIDE.lock().unwrap() = None;
+    *DATA_DIR_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn data_dir_override() -> Option<PathBuf> {
-    DATA_DIR_OVERRIDE.lock().unwrap().clone()
+    DATA_DIR_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Load config from the given path (any supported format).
@@ -399,6 +409,9 @@ pub fn save_user(user: &UserProfile) -> anyhow::Result<PathBuf> {
     if let Some(ref loc) = user.location {
         yaml_lines.push(format!("latitude: {}", loc.latitude));
         yaml_lines.push(format!("longitude: {}", loc.longitude));
+        if let Some(ref place) = loc.place {
+            yaml_lines.push(format!("location_place: {}", yaml_scalar(place)));
+        }
         if let Some(ts) = loc.updated_at {
             yaml_lines.push(format!("location_updated_at: {ts}"));
         }
@@ -454,6 +467,7 @@ fn parse_user_frontmatter(frontmatter: &str) -> UserProfile {
     let mut latitude: Option<f64> = None;
     let mut longitude: Option<f64> = None;
     let mut location_updated_at: Option<i64> = None;
+    let mut location_place: Option<String> = None;
 
     for raw in frontmatter.lines() {
         let line = raw.trim();
@@ -478,6 +492,7 @@ fn parse_user_frontmatter(frontmatter: &str) -> UserProfile {
             "latitude" => latitude = value.parse().ok(),
             "longitude" => longitude = value.parse().ok(),
             "location_updated_at" => location_updated_at = value.parse().ok(),
+            "location_place" => location_place = Some(value.to_string()),
             _ => {},
         }
     }
@@ -486,6 +501,7 @@ fn parse_user_frontmatter(frontmatter: &str) -> UserProfile {
         user.location = Some(crate::schema::GeoLocation {
             latitude: lat,
             longitude: lon,
+            place: location_place,
             updated_at: location_updated_at,
         });
     }
@@ -569,7 +585,7 @@ static CONFIG_SAVE_LOCK: Mutex<ConfigSaveState> = Mutex::new(ConfigSaveState { t
 /// Acquires a process-wide lock so concurrent callers cannot race.
 /// Returns the path written to.
 pub fn update_config(f: impl FnOnce(&mut MoltisConfig)) -> anyhow::Result<PathBuf> {
-    let mut guard = CONFIG_SAVE_LOCK.lock().unwrap();
+    let mut guard = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let target_path = find_or_default_config_path();
     guard.target_path = Some(target_path.clone());
     let mut config = discover_and_load();
@@ -583,10 +599,28 @@ pub fn update_config(f: impl FnOnce(&mut MoltisConfig)) -> anyhow::Result<PathBu
 ///
 /// Prefer [`update_config`] for read-modify-write cycles to avoid races.
 pub fn save_config(config: &MoltisConfig) -> anyhow::Result<PathBuf> {
-    let mut guard = CONFIG_SAVE_LOCK.lock().unwrap();
+    let mut guard = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let target_path = find_or_default_config_path();
     guard.target_path = Some(target_path.clone());
     save_config_to_path(&target_path, config)
+}
+
+/// Write raw TOML to the config file, preserving comments.
+///
+/// Validates the input by parsing it first. Acquires the config save lock
+/// so concurrent callers cannot race.  Returns the path written to.
+pub fn save_raw_config(toml_str: &str) -> anyhow::Result<PathBuf> {
+    let _: MoltisConfig =
+        toml::from_str(toml_str).map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    let mut guard = CONFIG_SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = find_or_default_config_path();
+    guard.target_path = Some(path.clone());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, toml_str)?;
+    debug!(path = %path.display(), "saved raw config");
+    Ok(path)
 }
 
 fn save_config_to_path(path: &Path, config: &MoltisConfig) -> anyhow::Result<PathBuf> {
@@ -743,7 +777,10 @@ fn set_nested(root: &mut serde_json::Value, path: &[String], val: serde_json::Va
         {
             map.insert(key.clone(), serde_json::Value::Object(Default::default()));
         }
-        current = current.get_mut(key).unwrap();
+        let Some(next) = current.get_mut(key) else {
+            return;
+        };
+        current = next;
     }
 }
 
@@ -775,6 +812,7 @@ fn parse_config_value(raw: &str, path: &Path) -> anyhow::Result<serde_json::Valu
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,7 +1072,8 @@ mod tests {
             location: Some(crate::schema::GeoLocation {
                 latitude: 48.8566,
                 longitude: 2.3522,
-                updated_at: Some(1700000000),
+                place: Some("Paris, France".to_string()),
+                updated_at: Some(1_700_000_000),
             }),
         };
 
@@ -1049,6 +1088,7 @@ mod tests {
         let loc = loaded.location.expect("location should be present");
         assert!((loc.latitude - 48.8566).abs() < 1e-6);
         assert!((loc.longitude - 2.3522).abs() < 1e-6);
+        assert_eq!(loc.place.as_deref(), Some("Paris, France"));
 
         clear_data_dir();
     }

@@ -40,6 +40,25 @@ async fn provision_packages(cli: &str, container_name: &str, packages: &[String]
     Ok(())
 }
 
+/// Check whether the current process is running as root (UID 0).
+fn is_running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("id")
+            .args(["-u"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .is_some_and(|uid| uid.trim() == "0")
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Check whether the current host is Debian/Ubuntu (has `/etc/debian_version`
 /// and `apt-get` on PATH).
 pub fn is_debian_host() -> bool {
@@ -112,6 +131,21 @@ pub async fn provision_host_packages(packages: &[String]) -> Result<Option<HostP
         .status()
         .await
         .is_ok_and(|s| s.success());
+
+    let is_root = is_running_as_root();
+
+    if !has_sudo && !is_root {
+        info!(
+            missing = missing.len(),
+            "not running as root and passwordless sudo unavailable; \
+             skipping host package provisioning (install packages in the container image instead)"
+        );
+        return Ok(Some(HostProvisionResult {
+            installed: Vec::new(),
+            skipped: missing,
+            used_sudo: false,
+        }));
+    }
 
     let pkg_list = missing.join(" ");
     let apt_update = if has_sudo {
@@ -389,18 +423,26 @@ pub trait Sandbox: Send + Sync {
 
 /// Compute the content-hash tag for a pre-built sandbox image.
 /// Pure function — independent of any specific container CLI.
-pub fn sandbox_image_tag(base: &str, packages: &[String]) -> String {
+pub fn sandbox_image_tag(repo: &str, base: &str, packages: &[String]) -> String {
     use std::hash::Hasher;
     let mut h = std::hash::DefaultHasher::new();
     // Bump this when the Dockerfile template changes to force a rebuild.
     h.write(b"v4");
+    h.write(repo.as_bytes());
     h.write(base.as_bytes());
     let mut sorted: Vec<&String> = packages.iter().collect();
     sorted.sort();
     for p in &sorted {
         h.write(p.as_bytes());
     }
-    format!("moltis-sandbox:{:016x}", h.finish())
+    format!("{repo}:{:016x}", h.finish())
+}
+
+fn is_sandbox_image_tag(tag: &str) -> bool {
+    let Some((repo, _)) = tag.split_once(':') else {
+        return false;
+    };
+    repo.ends_with("-sandbox")
 }
 
 /// Check whether a container image exists locally.
@@ -423,7 +465,7 @@ pub struct SandboxImage {
     pub created: String,
 }
 
-/// List all local `moltis-sandbox:*` images across available container CLIs.
+/// List all local `<instance>-sandbox:*` images across available container CLIs.
 pub async fn list_sandbox_images() -> Result<Vec<SandboxImage>> {
     let mut images = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -444,7 +486,7 @@ pub async fn list_sandbox_images() -> Result<Vec<SandboxImage>> {
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(3, '\t').collect();
                 if parts.len() == 3
-                    && parts[0].starts_with("moltis-sandbox:")
+                    && is_sandbox_image_tag(parts[0])
                     && seen.insert(parts[0].to_string())
                 {
                     images.push(SandboxImage {
@@ -469,7 +511,7 @@ pub async fn list_sandbox_images() -> Result<Vec<SandboxImage>> {
             for line in stdout.lines().skip(1) {
                 // Columns are whitespace-separated: NAME TAG DIGEST
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() >= 2 && cols[0] == "moltis-sandbox" {
+                if cols.len() >= 2 && cols[0].ends_with("-sandbox") {
                     let tag = format!("{}:{}", cols[0], cols[1]);
                     if !seen.insert(tag.clone()) {
                         continue;
@@ -536,10 +578,10 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Remove a specific `moltis-sandbox:*` image.
+/// Remove a specific `<instance>-sandbox:*` image.
 pub async fn remove_sandbox_image(tag: &str) -> Result<()> {
     anyhow::ensure!(
-        tag.starts_with("moltis-sandbox:"),
+        is_sandbox_image_tag(tag),
         "refusing to remove non-sandbox image: {tag}"
     );
     for cli in &["docker", "container"] {
@@ -566,7 +608,7 @@ pub async fn remove_sandbox_image(tag: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove all local `moltis-sandbox:*` images.
+/// Remove all local `<instance>-sandbox:*` images.
 pub async fn clean_sandbox_images() -> Result<usize> {
     let images = list_sandbox_images().await?;
     let count = images.len();
@@ -602,6 +644,10 @@ impl DockerSandbox {
 
     fn container_name(&self, id: &SandboxId) -> String {
         format!("{}-{}", self.container_prefix(), id.key)
+    }
+
+    fn image_repo(&self) -> &str {
+        self.container_prefix()
     }
 
     fn resource_args(&self) -> Vec<String> {
@@ -691,9 +737,9 @@ impl Sandbox for DockerSandbox {
             anyhow::bail!("docker run failed: {}", stderr.trim());
         }
 
-        // Skip provisioning if the image is a pre-built moltis-sandbox image
+        // Skip provisioning if the image is a pre-built instance sandbox image
         // (packages are already baked in — including /home/sandbox from the Dockerfile).
-        let is_prebuilt = image.starts_with("moltis-sandbox:");
+        let is_prebuilt = image.starts_with(&format!("{}:", self.image_repo()));
         if !is_prebuilt {
             provision_packages("docker", &name, &self.config.packages).await?;
         }
@@ -710,7 +756,7 @@ impl Sandbox for DockerSandbox {
             return Ok(None);
         }
 
-        let tag = sandbox_image_tag(base, packages);
+        let tag = sandbox_image_tag(self.image_repo(), base, packages);
 
         // Check if image already exists.
         if sandbox_image_exists("docker", &tag).await {
@@ -1001,6 +1047,10 @@ impl AppleContainerSandbox {
         format!("{}-{}", self.container_prefix(), id.key)
     }
 
+    fn image_repo(&self) -> &str {
+        self.container_prefix()
+    }
+
     /// Check whether the `container` CLI is available.
     pub async fn is_available() -> bool {
         tokio::process::Command::new("container")
@@ -1009,6 +1059,59 @@ impl AppleContainerSandbox {
             .await
             .is_ok_and(|o| o.status.success())
     }
+}
+
+/// Check whether the Apple Container system service is running.
+#[cfg(target_os = "macos")]
+fn is_apple_container_service_running() -> bool {
+    std::process::Command::new("container")
+        .args(["system", "status"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Try to start the Apple Container system service.
+/// Returns `true` if the service was successfully started.
+#[cfg(target_os = "macos")]
+fn try_start_apple_container_service() -> bool {
+    tracing::info!("apple container service is not running, starting it automatically");
+    let result = std::process::Command::new("container")
+        .args(["system", "start"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+    match result {
+        Ok(status) if status.success() => {
+            tracing::info!("apple container service started successfully");
+            true
+        },
+        Ok(status) => {
+            tracing::warn!(
+                exit_code = status.code(),
+                "failed to start apple container service; run `container system start` manually"
+            );
+            false
+        },
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to start apple container service; run `container system start` manually"
+            );
+            false
+        },
+    }
+}
+
+/// Ensure the Apple Container system service is running, starting it if needed.
+/// Returns `true` if the service is running (either already or after starting).
+#[cfg(target_os = "macos")]
+fn ensure_apple_container_service() -> bool {
+    if is_apple_container_service_running() {
+        return true;
+    }
+    try_start_apple_container_service()
 }
 
 #[cfg(target_os = "macos")]
@@ -1101,6 +1204,12 @@ impl Sandbox for AppleContainerSandbox {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("XPC connection error") || stderr.contains("Connection invalid") {
+                anyhow::bail!(
+                    "apple container service is not running. \
+                     Start it with `container system start` and restart moltis"
+                );
+            }
             anyhow::bail!(
                 "container run failed for {name} (image={image}): {}",
                 stderr.trim()
@@ -1109,9 +1218,9 @@ impl Sandbox for AppleContainerSandbox {
 
         info!(name, image, "apple container created and running");
 
-        // Skip provisioning if the image is a pre-built moltis-sandbox image
+        // Skip provisioning if the image is a pre-built instance sandbox image
         // (packages are already baked in — including /home/sandbox from the Dockerfile).
-        let is_prebuilt = image.starts_with("moltis-sandbox:");
+        let is_prebuilt = image.starts_with(&format!("{}:", self.image_repo()));
         if !is_prebuilt {
             provision_packages("container", &name, &self.config.packages).await?;
         }
@@ -1206,7 +1315,7 @@ impl Sandbox for AppleContainerSandbox {
             return Ok(None);
         }
 
-        let tag = sandbox_image_tag(base, packages);
+        let tag = sandbox_image_tag(self.image_repo(), base, packages);
 
         if sandbox_image_exists("container", &tag).await {
             info!(
@@ -1250,6 +1359,12 @@ WORKDIR /home/sandbox\n"
         let output = output?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("XPC connection error") || stderr.contains("Connection invalid") {
+                anyhow::bail!(
+                    "apple container service is not running. \
+                     Start it with `container system start` and restart moltis"
+                );
+            }
             anyhow::bail!("container build failed for {tag}: {}", stderr.trim());
         }
 
@@ -1298,7 +1413,15 @@ fn select_backend(config: SandboxConfig) -> Arc<dyn Sandbox> {
     match config.backend.as_str() {
         "docker" => Arc::new(DockerSandbox::new(config)),
         #[cfg(target_os = "macos")]
-        "apple-container" => Arc::new(AppleContainerSandbox::new(config)),
+        "apple-container" => {
+            if !ensure_apple_container_service() {
+                tracing::warn!(
+                    "apple container service could not be started; \
+                     run `container system start` manually, then restart moltis"
+                );
+            }
+            Arc::new(AppleContainerSandbox::new(config))
+        },
         _ => auto_detect_backend(config),
     }
 }
@@ -1307,8 +1430,14 @@ fn auto_detect_backend(config: SandboxConfig) -> Arc<dyn Sandbox> {
     #[cfg(target_os = "macos")]
     {
         if is_cli_available("container") {
-            tracing::info!("sandbox backend: apple-container (VM-isolated, preferred)");
-            return Arc::new(AppleContainerSandbox::new(config));
+            if ensure_apple_container_service() {
+                tracing::info!("sandbox backend: apple-container (VM-isolated, preferred)");
+                return Arc::new(AppleContainerSandbox::new(config));
+            }
+            tracing::warn!(
+                "apple container CLI found but service could not be started; \
+                 falling back to docker"
+            );
         }
     }
 
@@ -1541,6 +1670,7 @@ impl SandboxRouter {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,14 +1741,10 @@ mod tests {
         };
         let docker = DockerSandbox::new(config);
         let args = docker.resource_args();
-        assert_eq!(args, vec![
-            "--memory",
-            "256M",
-            "--cpus",
-            "0.5",
-            "--pids-limit",
-            "50"
-        ]);
+        assert_eq!(
+            args,
+            vec!["--memory", "256M", "--cpus", "0.5", "--pids-limit", "50"]
+        );
     }
 
     #[test]
@@ -1890,10 +2016,10 @@ mod tests {
     #[test]
     fn test_docker_image_tag_deterministic() {
         let packages = vec!["curl".into(), "git".into(), "wget".into()];
-        let tag1 = sandbox_image_tag("ubuntu:25.10", &packages);
-        let tag2 = sandbox_image_tag("ubuntu:25.10", &packages);
+        let tag1 = sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &packages);
+        let tag2 = sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &packages);
         assert_eq!(tag1, tag2);
-        assert!(tag1.starts_with("moltis-sandbox:"));
+        assert!(tag1.starts_with("moltis-main-sandbox:"));
     }
 
     #[test]
@@ -1901,16 +2027,16 @@ mod tests {
         let p1 = vec!["curl".into(), "git".into()];
         let p2 = vec!["git".into(), "curl".into()];
         assert_eq!(
-            sandbox_image_tag("ubuntu:25.10", &p1),
-            sandbox_image_tag("ubuntu:25.10", &p2),
+            sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &p1),
+            sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &p2),
         );
     }
 
     #[test]
     fn test_docker_image_tag_changes_with_base() {
         let packages = vec!["curl".into()];
-        let t1 = sandbox_image_tag("ubuntu:25.10", &packages);
-        let t2 = sandbox_image_tag("ubuntu:24.04", &packages);
+        let t1 = sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &packages);
+        let t2 = sandbox_image_tag("moltis-main-sandbox", "ubuntu:24.04", &packages);
         assert_ne!(t1, t2);
     }
 
@@ -1918,8 +2044,8 @@ mod tests {
     fn test_docker_image_tag_changes_with_packages() {
         let p1 = vec!["curl".into()];
         let p2 = vec!["curl".into(), "git".into()];
-        let t1 = sandbox_image_tag("ubuntu:25.10", &p1);
-        let t2 = sandbox_image_tag("ubuntu:25.10", &p2);
+        let t1 = sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &p1);
+        let t2 = sandbox_image_tag("moltis-main-sandbox", "ubuntu:25.10", &p2);
         assert_ne!(t1, t2);
     }
 
@@ -2058,6 +2184,14 @@ mod tests {
         }
         let result = provision_host_packages(&["curl".into()]).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_is_running_as_root() {
+        // In CI and dev, we typically don't run as root.
+        let result = is_running_as_root();
+        // Just verify it returns a bool without panic.
+        let _ = result;
     }
 
     #[test]

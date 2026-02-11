@@ -183,9 +183,12 @@ impl DedupeCache {
         {
             self.entries.remove(&oldest_key);
         }
-        self.entries.insert(key.to_string(), DedupeEntry {
-            inserted_at: Instant::now(),
-        });
+        self.entries.insert(
+            key.to_string(),
+            DedupeEntry {
+                inserted_at: Instant::now(),
+            },
+        );
         false
     }
 
@@ -286,6 +289,9 @@ pub struct GatewayInner {
     pub llm_providers: Option<Arc<tokio::sync::RwLock<moltis_agents::providers::ProviderRegistry>>>,
     /// Cached user geolocation from browser Geolocation API, persisted to `USER.md`.
     pub cached_location: Option<moltis_config::GeoLocation>,
+    /// Per-session buffer for channel status messages (tool use, model selection).
+    /// Drained when the final response is delivered to the channel.
+    pub channel_status_log: HashMap<String, Vec<String>>,
 }
 
 impl GatewayInner {
@@ -315,6 +321,7 @@ impl GatewayInner {
             push_service: None,
             llm_providers: None,
             cached_location: moltis_config::load_user().and_then(|u| u.location),
+            channel_status_log: HashMap::new(),
         }
     }
 
@@ -360,6 +367,10 @@ pub struct GatewayState {
     pub memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
     /// Whether the server is bound to a loopback address (localhost/127.0.0.1/::1).
     pub localhost_only: bool,
+    /// Whether the server is known to be behind a reverse proxy.
+    /// Set via `MOLTIS_BEHIND_PROXY=true`.  When true, loopback source IPs are
+    /// never treated as proof of a direct local connection.
+    pub behind_proxy: bool,
     /// Whether TLS is active on the gateway listener.
     pub tls_active: bool,
     /// Whether WebSocket request/response logging is enabled.
@@ -396,6 +407,7 @@ impl GatewayState {
             None,
             false,
             false,
+            false,
             None,
             None,
             18789,
@@ -415,6 +427,7 @@ impl GatewayState {
         sandbox_router: Option<Arc<SandboxRouter>>,
         credential_store: Option<Arc<CredentialStore>>,
         localhost_only: bool,
+        behind_proxy: bool,
         tls_active: bool,
         hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
         memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
@@ -438,6 +451,7 @@ impl GatewayState {
             sandbox_router,
             memory_manager,
             localhost_only,
+            behind_proxy,
             tls_active,
             ws_request_logs,
             deploy_platform,
@@ -561,6 +575,29 @@ impl GatewayState {
     /// Take (and remove) the last error for a run_id.
     pub async fn last_run_error(&self, run_id: &str) -> Option<String> {
         self.inner.write().await.run_errors.remove(run_id)
+    }
+
+    /// Append a status line (e.g. tool use, model selection) to the channel
+    /// status log for a session. These are drained and appended as a logbook
+    /// when the final response is delivered.
+    pub async fn push_channel_status_log(&self, session_key: &str, message: String) {
+        self.inner
+            .write()
+            .await
+            .channel_status_log
+            .entry(session_key.to_string())
+            .or_default()
+            .push(message);
+    }
+
+    /// Drain all buffered status log entries for a session.
+    pub async fn drain_channel_status_log(&self, session_key: &str) -> Vec<String> {
+        self.inner
+            .write()
+            .await
+            .channel_status_log
+            .remove(session_key)
+            .unwrap_or_default()
     }
 
     /// Close a client: remove from registry and unregister from nodes.

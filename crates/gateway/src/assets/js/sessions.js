@@ -10,7 +10,6 @@ import {
 	stripChannelPrefix,
 	updateTokenBar,
 } from "./chat-ui.js";
-import { mountRunDetail } from "./run-detail-mount.js";
 import * as gon from "./gon.js";
 import {
 	formatTokens,
@@ -22,6 +21,7 @@ import {
 } from "./helpers.js";
 import { updateSessionProjectSelect } from "./project-combo.js";
 import { currentPrefix, navigate, sessionPath } from "./router.js";
+import { mountRunDetail } from "./run-detail-mount.js";
 import { updateSandboxImageUI, updateSandboxUI } from "./sandbox.js";
 import * as S from "./state.js";
 import { modelStore } from "./stores/model-store.js";

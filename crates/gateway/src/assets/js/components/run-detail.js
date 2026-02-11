@@ -11,9 +11,11 @@ var TABS = ["overview", "actions", "messages"];
 
 function TabButton({ label, active, onClick }) {
 	return html`<button
-		class="text-xs px-2 py-1 rounded-md transition-colors cursor-pointer bg-transparent border ${active
-			? "border-[var(--accent)] text-[var(--accent)] font-semibold"
-			: "border-[var(--border)] text-[var(--muted)]"}"
+		class="text-xs px-2 py-1 rounded-md transition-colors cursor-pointer bg-transparent border ${
+			active
+				? "border-[var(--accent)] text-[var(--accent)] font-semibold"
+				: "border-[var(--border)] text-[var(--muted)]"
+		}"
 		onClick=${onClick}
 	>
 		${label}
@@ -49,26 +51,29 @@ function OverviewTab({ data }) {
 			<span class="text-[var(--muted)]">Assistant messages:</span>
 			<span class="font-medium">${summary.assistantMessages || 0}</span>
 		</div>
-		${model
-			? html`<div class="flex gap-4">
+		${
+			model
+				? html`<div class="flex gap-4">
 					<span class="text-[var(--muted)]">Model:</span>
 					<span class="font-medium">${provider ? `${provider} / ` : ""}${model}</span>
 				</div>`
-			: null}
-		${totalInput + totalOutput > 0
-			? html`<div class="flex gap-4">
+				: null
+		}
+		${
+			totalInput + totalOutput > 0
+				? html`<div class="flex gap-4">
 					<span class="text-[var(--muted)]">Tokens:</span>
 					<span class="font-medium">${totalInput} in / ${totalOutput} out</span>
 				</div>`
-			: null}
+				: null
+		}
 	</div>`;
 }
 
 function ActionsTab({ data }) {
 	if (!data) return null;
 	var toolResults = (data.messages || []).filter((m) => m.role === "tool_result");
-	if (toolResults.length === 0)
-		return html`<div class="text-xs text-[var(--muted)]">No tool calls in this run.</div>`;
+	if (toolResults.length === 0) return html`<div class="text-xs text-[var(--muted)]">No tool calls in this run.</div>`;
 	return html`<div class="flex flex-col gap-2">
 		${toolResults.map(
 			(tr) =>
@@ -81,16 +86,16 @@ function ActionsTab({ data }) {
 							>${tr.success ? "ok" : "error"}</span
 						>
 					</div>
-					${tr.arguments
-						? html`<pre
+					${
+						tr.arguments
+							? html`<pre
 								class="mt-1 font-mono whitespace-pre-wrap break-words text-[var(--muted)]"
 							>
 ${JSON.stringify(tr.arguments, null, 2)}</pre
 							>`
-						: null}
-					${tr.error
-						? html`<div class="mt-1 text-red-500">${tr.error}</div>`
-						: null}
+							: null
+					}
+					${tr.error ? html`<div class="mt-1 text-red-500">${tr.error}</div>` : null}
 				</div>`,
 		)}
 	</div>`;
@@ -99,8 +104,7 @@ ${JSON.stringify(tr.arguments, null, 2)}</pre
 function MessagesTab({ data }) {
 	if (!data) return null;
 	var messages = data.messages || [];
-	if (messages.length === 0)
-		return html`<div class="text-xs text-[var(--muted)]">No messages.</div>`;
+	if (messages.length === 0) return html`<div class="text-xs text-[var(--muted)]">No messages.</div>`;
 	return html`<div class="flex flex-col gap-1">
 		${messages.map(
 			(m, i) =>
@@ -111,13 +115,15 @@ function MessagesTab({ data }) {
 						>${m.role}</span
 					>
 					<span class="text-[var(--muted)] ml-1">#${i}</span>
-					${typeof m.content === "string" && m.content
-						? html`<div
+					${
+						typeof m.content === "string" && m.content
+							? html`<div
 								class="mt-0.5 font-mono whitespace-pre-wrap break-words max-h-32 overflow-auto"
 							>
-								${m.content.length > 500 ? m.content.slice(0, 500) + "\u2026" : m.content}
+								${m.content.length > 500 ? `${m.content.slice(0, 500)}\u2026` : m.content}
 							</div>`
-						: null}
+							: null
+					}
 				</div>`,
 		)}
 	</div>`;
@@ -150,13 +156,15 @@ export function RunDetail({ sessionKey, runId }) {
 		>
 			${expanded ? "\u25bc" : "\u25b6"} Run details
 		</button>
-		${expanded
-			? html`<div
+		${
+			expanded
+				? html`<div
 					class="mt-2 border border-[var(--border)] rounded-md p-3 bg-[var(--bg)]"
 				>
-					${loading
-						? html`<div class="text-xs text-[var(--muted)]">Loading\u2026</div>`
-						: html`<div>
+					${
+						loading
+							? html`<div class="text-xs text-[var(--muted)]">Loading\u2026</div>`
+							: html`<div>
 								<div class="flex gap-1 mb-2">
 									${TABS.map(
 										(t) =>
@@ -170,8 +178,10 @@ export function RunDetail({ sessionKey, runId }) {
 								${activeTab === "overview" && html`<${OverviewTab} data=${data} />`}
 								${activeTab === "actions" && html`<${ActionsTab} data=${data} />`}
 								${activeTab === "messages" && html`<${MessagesTab} data=${data} />`}
-							</div>`}
+							</div>`
+					}
 				</div>`
-			: null}
+				: null
+		}
 	</div>`;
 }

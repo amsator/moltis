@@ -327,25 +327,24 @@ mod tests {
     #[test]
     fn strip_capitalized_thinking() {
         let input = "<Thinking>Let me reason about this...</Thinking>Here is my answer.";
-        assert_eq!(
-            strip_reasoning_patterns(input),
-            "Here is my answer."
-        );
+        assert_eq!(strip_reasoning_patterns(input), "Here is my answer.");
     }
 
     // ── clean_response (integration) ───────────────────────────────
 
     #[test]
     fn clean_response_strips_all_tag_types() {
-        let input =
-            "<thinking>reasoning</thinking>Answer here<|eot_id|><|im_end|>";
+        let input = "<thinking>reasoning</thinking>Answer here<|eot_id|><|im_end|>";
         assert_eq!(clean_response(input), "Answer here");
     }
 
     #[test]
     fn clean_response_preserves_normal_text() {
         let input = "This is a normal response with no tags.";
-        assert_eq!(clean_response(input), "This is a normal response with no tags.");
+        assert_eq!(
+            clean_response(input),
+            "This is a normal response with no tags."
+        );
     }
 
     #[test]
@@ -374,7 +373,8 @@ mod tests {
 
     #[test]
     fn recover_tool_call_with_tool_key() {
-        let input = r#"<tool_call>{"tool": "web_search", "arguments": {"query": "rust"}}</tool_call>"#;
+        let input =
+            r#"<tool_call>{"tool": "web_search", "arguments": {"query": "rust"}}</tool_call>"#;
         let (cleaned, calls) = recover_tool_calls_from_content(input);
         assert_eq!(cleaned, "");
         assert_eq!(calls.len(), 1);

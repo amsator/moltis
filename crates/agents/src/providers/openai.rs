@@ -569,17 +569,11 @@ mod tests {
     // ── model_metadata tests ──────────────────────────────────────────
 
     /// Start a mock server with both /chat/completions and /models/:model endpoints.
-    async fn start_model_metadata_mock(
-        model_response: Option<serde_json::Value>,
-    ) -> String {
+    async fn start_model_metadata_mock(model_response: Option<serde_json::Value>) -> String {
         use axum::routing::get;
 
-        let mut app = Router::new().route(
-            "/chat/completions",
-            post(|| async {
-                "data: [DONE]\n\n"
-            }),
-        );
+        let mut app =
+            Router::new().route("/chat/completions", post(|| async { "data: [DONE]\n\n" }));
 
         if let Some(resp) = model_response {
             let resp_str = serde_json::to_string(&resp).unwrap();

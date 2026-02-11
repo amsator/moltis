@@ -155,11 +155,7 @@ impl SessionStore {
     /// Returns messages that have a matching `run_id` field, plus adjacent
     /// `tool_result` messages that sit between the matching user and assistant
     /// messages (these don't carry `run_id` themselves but belong to the run).
-    pub async fn read_by_run_id(
-        &self,
-        key: &str,
-        run_id: &str,
-    ) -> Result<Vec<serde_json::Value>> {
+    pub async fn read_by_run_id(&self, key: &str, run_id: &str) -> Result<Vec<serde_json::Value>> {
         let all = self.read(key).await?;
         let run_id = run_id.to_string();
 

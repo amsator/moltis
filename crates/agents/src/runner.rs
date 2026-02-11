@@ -606,21 +606,22 @@ pub async fn run_agent_loop_with_context(
         }
 
         // Fallback: recover tool calls from XML blocks (<function_call>, <tool_call>).
-        if !native_tools && response.tool_calls.is_empty() {
-            if let Some(ref text) = response.text {
-                let (cleaned, recovered) = recover_tool_calls_from_content(text);
-                if !recovered.is_empty() {
-                    info!(
-                        count = recovered.len(),
-                        "recovered tool calls from XML blocks in response text"
-                    );
-                    response.text = if cleaned.is_empty() {
-                        None
-                    } else {
-                        Some(cleaned)
-                    };
-                    response.tool_calls = recovered;
-                }
+        if !native_tools
+            && response.tool_calls.is_empty()
+            && let Some(ref text) = response.text
+        {
+            let (cleaned, recovered) = recover_tool_calls_from_content(text);
+            if !recovered.is_empty() {
+                info!(
+                    count = recovered.len(),
+                    "recovered tool calls from XML blocks in response text"
+                );
+                response.text = if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                };
+                response.tool_calls = recovered;
             }
         }
 

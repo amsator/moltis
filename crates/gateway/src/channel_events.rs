@@ -72,10 +72,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         }
     }
@@ -108,10 +113,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 "sessionKey": &session_key,
                 "messageIndex": msg_index,
             });
-            broadcast(state, "chat", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "chat",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
 
             // Register the reply target so the chat "final" broadcast can
@@ -336,10 +346,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         } else {
             warn!("request_disable_account: gateway not ready");
@@ -541,10 +556,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
             "messageIndex": msg_index,
             "hasAttachments": true,
         });
-        broadcast(state, "chat", payload, BroadcastOpts {
-            drop_if_slow: true,
-            ..Default::default()
-        })
+        broadcast(
+            state,
+            "chat",
+            payload,
+            BroadcastOpts {
+                drop_if_slow: true,
+                ..Default::default()
+            },
+        )
         .await;
 
         // Register the reply target
@@ -1074,7 +1094,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .and_then(|v| v.as_str())
                         .unwrap_or(model_id);
 
-                    state
+                    let patch_res = state
                         .services
                         .session
                         .patch(serde_json::json!({
@@ -1083,6 +1103,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
                     broadcast(
                         state,
@@ -1090,6 +1114,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         serde_json::json!({
                             "kind": "patched",
                             "sessionKey": &session_key,
+                            "version": version,
                         }),
                         BroadcastOpts {
                             drop_if_slow: true,
@@ -1162,7 +1187,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     Ok(lines.join("\n"))
                 } else if args == "on" || args == "off" {
                     let new_val = args == "on";
-                    state
+                    let patch_res = state
                         .services
                         .session
                         .patch(serde_json::json!({
@@ -1171,12 +1196,17 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     broadcast(
                         state,
                         "session",
                         serde_json::json!({
                             "kind": "patched",
                             "sessionKey": &session_key,
+                            "version": version,
                         }),
                         BroadcastOpts {
                             drop_if_slow: true,
@@ -1214,7 +1244,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     } else {
                         chosen.as_str()
                     };
-                    state
+                    let patch_res = state
                         .services
                         .session
                         .patch(serde_json::json!({
@@ -1223,6 +1253,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }))
                         .await
                         .map_err(|e| anyhow!("{e}"))?;
+                    let version = patch_res
+                        .get("version")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
 
                     broadcast(
                         state,
@@ -1230,6 +1264,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         serde_json::json!({
                             "kind": "patched",
                             "sessionKey": &session_key,
+                            "version": version,
                         }),
                         BroadcastOpts {
                             drop_if_slow: true,

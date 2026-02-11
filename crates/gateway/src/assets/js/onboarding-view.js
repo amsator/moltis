@@ -15,11 +15,12 @@ import { startProviderOAuth } from "./provider-oauth.js";
 import { testModel, validateProviderKey } from "./provider-validation.js";
 import * as S from "./state.js";
 import { fetchPhrase } from "./tts-phrases.js";
+import { forceReconnect } from "./ws-connect.js";
 
 // ── Step indicator ──────────────────────────────────────────
 
-var BASE_STEP_LABELS = ["Security", "Identity", "Provider", "Channel", "Summary"];
-var VOICE_STEP_LABELS = ["Security", "Identity", "Provider", "Voice", "Channel", "Summary"];
+var BASE_STEP_LABELS = ["Security", "Identity", "LLM", "Channel", "Summary"];
+var VOICE_STEP_LABELS = ["Security", "Identity", "LLM", "Voice", "Channel", "Summary"];
 
 function preferredChatPath() {
 	var key = localStorage.getItem("moltis-session") || "main";
@@ -136,6 +137,7 @@ function AuthStep({ onNext, skippable }) {
 		})
 			.then((r) => {
 				if (r.ok) {
+					forceReconnect();
 					onNext();
 				} else {
 					return r.text().then((t) => {
@@ -203,6 +205,7 @@ function AuthStep({ onNext, skippable }) {
 			})
 			.then((r) => {
 				if (r.ok) {
+					forceReconnect();
 					setSaving(false);
 					setPasskeyDone(true);
 				} else {
@@ -241,6 +244,7 @@ function AuthStep({ onNext, skippable }) {
 		})
 			.then((r) => {
 				if (r.ok) {
+					forceReconnect();
 					onNext();
 				} else {
 					return r.text().then((t) => {
@@ -302,7 +306,10 @@ function AuthStep({ onNext, skippable }) {
 					<button type="submit" class="provider-btn" disabled=${optPwSaving}>
 						${optPwSaving ? "Setting\u2026" : "Set password & continue"}
 					</button>
-					<button type="button" class="text-xs text-[var(--muted)] cursor-pointer bg-transparent border-none underline" onClick=${onNext}>Skip</button>
+					<button type="button" class="text-xs text-[var(--muted)] cursor-pointer bg-transparent border-none underline" onClick=${() => {
+						forceReconnect();
+						onNext();
+					}}>Skip</button>
 				</div>
 			</form>
 		</div>`;
@@ -1166,18 +1173,18 @@ function ProviderStep({ onNext, onBack }) {
 	// ── Render ────────────────────────────────────────────────
 
 	if (loading) {
-		return html`<div class="text-sm text-[var(--muted)]">Loading providers\u2026</div>`;
+		return html`<div class="text-sm text-[var(--muted)]">Loading LLMs\u2026</div>`;
 	}
 
 	var configuredProviders = providers.filter((p) => p.configured);
 
 	return html`<div class="flex flex-col gap-4">
-		<h2 class="text-lg font-medium text-[var(--text-strong)]">Add providers</h2>
+		<h2 class="text-lg font-medium text-[var(--text-strong)]">Add LLMs</h2>
 		<p class="text-xs text-[var(--muted)] leading-relaxed">Configure one or more LLM providers to power your agent. You can add more later in Settings.</p>
 		${
 			configuredProviders.length > 0
 				? html`<div class="rounded-md border border-[var(--border)] bg-[var(--surface2)] p-3 flex flex-col gap-2">
-				<div class="text-xs text-[var(--muted)]">Detected providers</div>
+				<div class="text-xs text-[var(--muted)]">Detected LLM providers</div>
 				<div class="flex flex-wrap gap-2">
 					${configuredProviders.map((p) => html`<span key=${p.name} class="provider-item-badge configured">${p.displayName}</span>`)}
 				</div>
@@ -1345,7 +1352,14 @@ function OnboardingVoiceRow({
 			</div>`
 				: null
 		}
-		${voiceTestResult?.error ? html`<span class="text-xs text-[var(--error)] mt-1 block">${voiceTestResult.error}</span>` : null}
+		${
+			voiceTestResult?.error
+				? html`<div class="voice-error-result">
+			<span class="icon icon-md icon-x-circle"></span>
+			<span>${voiceTestResult.error}</span>
+		</div>`
+				: null
+		}
 		${
 			isConfiguring
 				? html`<form onSubmit=${onSaveKey} class="flex flex-col gap-2 mt-3 border-t border-[var(--border)] pt-3">
@@ -1581,11 +1595,22 @@ function VoiceStep({ onNext, onBack }) {
 				});
 				if (res?.ok && res.payload?.audio) {
 					var bytes = decodeBase64Safe(res.payload.audio);
-					var blob = new Blob([bytes], { type: res.payload.content_type || "audio/mpeg" });
+					var audioMime = res.payload.mimeType || res.payload.content_type || "audio/mpeg";
+					console.log(
+						"[TTS] audio received: %d bytes, mime=%s, format=%s",
+						bytes.length,
+						audioMime,
+						res.payload.format,
+					);
+					var blob = new Blob([bytes], { type: audioMime });
 					var url = URL.createObjectURL(blob);
 					var audio = new Audio(url);
+					audio.onerror = (e) => {
+						console.error("[TTS] audio element error:", audio.error?.message || e);
+						URL.revokeObjectURL(url);
+					};
 					audio.onended = () => URL.revokeObjectURL(url);
-					audio.play().catch(() => undefined);
+					audio.play().catch((e) => console.error("[TTS] play() failed:", e));
 					setVoiceTestResults((prev) => ({ ...prev, [providerId]: { success: true, error: null } }));
 				} else {
 					setVoiceTestResults((prev) => ({
@@ -1634,20 +1659,36 @@ function VoiceStep({ onNext, onBack }) {
 								body: audioBlob,
 							},
 						);
-						var sttRes = await resp.json();
+						console.log("[STT] upload response: status=%d ok=%s", resp.status, resp.ok);
+						if (resp.ok) {
+							var sttRes = await resp.json();
 
-						if (sttRes.ok && sttRes.transcription?.text) {
-							setVoiceTestResults((prev) => ({
-								...prev,
-								[providerId]: { text: sttRes.transcription.text, error: null },
-							}));
+							if (sttRes.ok && sttRes.transcription?.text) {
+								setVoiceTestResults((prev) => ({
+									...prev,
+									[providerId]: { text: sttRes.transcription.text, error: null },
+								}));
+							} else {
+								setVoiceTestResults((prev) => ({
+									...prev,
+									[providerId]: {
+										text: null,
+										error: sttRes.transcriptionError || sttRes.error || "STT test failed",
+									},
+								}));
+							}
 						} else {
+							var errBody = await resp.text();
+							console.error("[STT] upload failed: status=%d body=%s", resp.status, errBody);
+							var errMsg = "STT test failed";
+							try {
+								errMsg = JSON.parse(errBody)?.error || errMsg;
+							} catch (_e) {
+								// not JSON
+							}
 							setVoiceTestResults((prev) => ({
 								...prev,
-								[providerId]: {
-									text: null,
-									error: sttRes.transcriptionError || sttRes.error || "STT test failed",
-								},
+								[providerId]: { text: null, error: `${errMsg} (HTTP ${resp.status})` },
 							}));
 						}
 					} catch (fetchErr) {
@@ -1835,13 +1876,24 @@ function ChannelStep({ onNext, onBack }) {
 					<label class="text-xs text-[var(--muted)] mb-1 block">Bot username</label>
 					<input type="text" class="provider-key-input w-full"
 						value=${accountId} onInput=${(e) => setAccountId(e.target.value)}
-						placeholder="e.g. my_assistant_bot" autofocus />
+						placeholder="e.g. my_assistant_bot"
+						autocomplete="off"
+						autocapitalize="none"
+						autocorrect="off"
+						spellcheck="false"
+						name="telegram_bot_username"
+						autofocus />
 				</div>
 				<div>
 					<label class="text-xs text-[var(--muted)] mb-1 block">Bot token (from @BotFather)</label>
-					<input type="password" class="provider-key-input w-full"
+					<input type="text" class="provider-key-input w-full"
 						value=${token} onInput=${(e) => setToken(e.target.value)}
-						placeholder="123456:ABC-DEF..." />
+						placeholder="123456:ABC-DEF..."
+						autocomplete="off"
+						autocapitalize="none"
+						autocorrect="off"
+						spellcheck="false"
+						name="telegram_bot_token" />
 				</div>
 				<div>
 					<label class="text-xs text-[var(--muted)] mb-1 block">DM Policy</label>
@@ -1979,15 +2031,15 @@ function SummaryStep({ onBack, onFinish }) {
 				${
 					data.identity?.user_name && data.identity?.name
 						? html`You: <span class="font-medium text-[var(--text)]">${data.identity.user_name}</span>
-						${" "}Agent: <span class="font-medium text-[var(--text)]">${data.identity.emoji || ""} ${data.identity.name}</span>`
+						Agent: <span class="font-medium text-[var(--text)]">${data.identity.emoji || ""} ${data.identity.name}</span>`
 						: html`<span class="text-[var(--warn)]">Identity not fully configured</span>`
 				}
 			<//>
 
-			<!-- Providers -->
+			<!-- LLMs -->
 			<${SummaryRow}
 				icon=${configuredProviders.length > 0 ? html`<${CheckIcon} />` : html`<${ErrorIcon} />`}
-				label="Providers">
+				label="LLMs">
 				${
 					configuredProviders.length > 0
 						? html`<div class="flex flex-col gap-1">
@@ -1996,7 +2048,7 @@ function SummaryStep({ onBack, onFinish }) {
 						</div>
 						${activeModel ? html`<div>Active model: <span class="font-mono font-medium text-[var(--text)]">${activeModel}</span></div>` : null}
 					</div>`
-						: html`<span class="text-[var(--error)]">No providers configured</span>`
+						: html`<span class="text-[var(--error)]">No LLM providers configured</span>`
 				}
 			<//>
 
@@ -2036,8 +2088,8 @@ function SummaryStep({ onBack, onFinish }) {
 				${
 					data.mem
 						? html`Total: <span class="font-medium text-[var(--text)]">${formatMemBytes(data.mem.total)}</span>
-						${" "}Available: <span class="font-medium text-[var(--text)]">${formatMemBytes(data.mem.available)}</span>
-						${data.mem.total && data.mem.total < LOW_MEMORY_THRESHOLD ? html`<div class="text-[var(--warn)] mt-1">Low memory detected. Consider cloud deployment for better performance.</div>` : null}`
+						Available: <span class="font-medium text-[var(--text)]">${formatMemBytes(data.mem.available)}</span>
+						${data.mem.total && data.mem.total < LOW_MEMORY_THRESHOLD ? html`<div class="text-[var(--warn)] mt-1">Low memory detected. Consider upgrading to an instance with more RAM.</div>` : null}`
 						: html`Memory info unavailable`
 				}
 			<//>

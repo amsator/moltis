@@ -1316,12 +1316,32 @@ impl MethodRegistry {
             "sessions.patch",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.state
+                    let key = ctx
+                        .params
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let result = ctx
+                        .state
                         .services
                         .session
                         .patch(ctx.params.clone())
                         .await
-                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))?;
+                    let version = result.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+                    broadcast(
+                        &ctx.state,
+                        "session",
+                        serde_json::json!({
+                            "kind": "patched",
+                            "sessionKey": key,
+                            "version": version,
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+                    Ok(result)
                 })
             }),
         );
@@ -3181,12 +3201,30 @@ impl MethodRegistry {
             "providers.save_key",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.state
+                    let provider_name = ctx
+                        .params
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+
+                    let result = ctx
+                        .state
                         .services
                         .provider_setup
                         .save_key(ctx.params.clone())
                         .await
-                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))?;
+
+                    // Kick off background model detection after saving provider
+                    // credentials, matching the behaviour of oauth.complete.
+                    let model_service = Arc::clone(&ctx.state.services.model);
+                    tokio::spawn(async move {
+                        let _ = model_service
+                            .detect_supported(model_probe_params(provider_name.as_deref()))
+                            .await;
+                    });
+
+                    Ok(result)
                 })
             }),
         );
@@ -5646,10 +5684,10 @@ mod tests {
             VoiceProviderId::parse_tts_list_id,
         );
         let ids: Vec<_> = filtered.into_iter().map(|p| p.id).collect();
-        assert_eq!(ids, vec![
-            VoiceProviderId::OpenaiTts,
-            VoiceProviderId::Piper
-        ]);
+        assert_eq!(
+            ids,
+            vec![VoiceProviderId::OpenaiTts, VoiceProviderId::Piper]
+        );
     }
 
     #[test]

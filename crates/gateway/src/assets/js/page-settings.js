@@ -9,10 +9,21 @@ import { onEvent } from "./events.js";
 import * as gon from "./gon.js";
 import { refresh as refreshGon } from "./gon.js";
 import { sendRpc } from "./helpers.js";
+// Moved page init/teardown imports
+import { initChannels, teardownChannels } from "./page-channels.js";
+import { initCrons, teardownCrons } from "./page-crons.js";
+import { initHooks, teardownHooks } from "./page-hooks.js";
+import { initImages, teardownImages } from "./page-images.js";
+import { initLogs, teardownLogs } from "./page-logs.js";
+import { initMcp, teardownMcp } from "./page-mcp.js";
+import { initMonitoring, teardownMonitoring } from "./page-metrics.js";
+import { initProviders, teardownProviders } from "./page-providers.js";
+import { initSkills, teardownSkills } from "./page-skills.js";
 import { detectPasskeyName } from "./passkey-detect.js";
 import * as push from "./push.js";
 import { isStandalone } from "./pwa.js";
 import { navigate, registerPrefix } from "./router.js";
+import { routes, settingsPath } from "./routes.js";
 import { connected } from "./signals.js";
 import * as S from "./state.js";
 import { fetchPhrase } from "./tts-phrases.js";
@@ -26,6 +37,15 @@ var containerRef = null;
 
 function rerender() {
 	if (containerRef) render(html`<${SettingsPage} />`, containerRef);
+}
+
+function isSafariBrowser() {
+	if (typeof navigator === "undefined") return false;
+	var ua = navigator.userAgent || "";
+	var vendor = navigator.vendor || "";
+	if (!ua.includes("Safari/")) return false;
+	if (/(Chrome|CriOS|Chromium|Edg|OPR|FxiOS|Firefox|SamsungBrowser)/.test(ua)) return false;
+	return /Apple/i.test(vendor) || ua.includes("Safari/");
 }
 
 function fetchIdentity() {
@@ -47,10 +67,16 @@ function fetchIdentity() {
 // ── Sidebar navigation items ─────────────────────────────────
 
 var sections = [
+	{ group: "General" },
 	{
 		id: "identity",
 		label: "Identity",
 		icon: html`<span class="icon icon-person"></span>`,
+	},
+	{
+		id: "environment",
+		label: "Environment",
+		icon: html`<span class="icon icon-terminal"></span>`,
 	},
 	{
 		id: "memory",
@@ -58,10 +84,17 @@ var sections = [
 		icon: html`<span class="icon icon-database"></span>`,
 	},
 	{
-		id: "environment",
-		label: "Environment",
-		icon: html`<span class="icon icon-terminal"></span>`,
+		id: "notifications",
+		label: "Notifications",
+		icon: html`<span class="icon icon-bell"></span>`,
 	},
+	{
+		id: "crons",
+		label: "Crons",
+		icon: html`<span class="icon icon-cron"></span>`,
+		page: true,
+	},
+	{ group: "Security" },
 	{
 		id: "security",
 		label: "Security",
@@ -77,15 +110,60 @@ var sections = [
 		label: "Tailscale",
 		icon: html`<span class="icon icon-globe"></span>`,
 	},
+	{ group: "Integrations" },
+	{
+		id: "providers",
+		label: "LLMs",
+		icon: html`<span class="icon icon-server"></span>`,
+		page: true,
+	},
+	{
+		id: "channels",
+		label: "Channels",
+		icon: html`<span class="icon icon-channels"></span>`,
+		page: true,
+	},
 	{
 		id: "voice",
 		label: "Voice",
 		icon: html`<span class="icon icon-microphone"></span>`,
 	},
 	{
-		id: "notifications",
-		label: "Notifications",
-		icon: html`<span class="icon icon-bell"></span>`,
+		id: "mcp",
+		label: "MCP",
+		icon: html`<span class="icon icon-link"></span>`,
+		page: true,
+	},
+	{
+		id: "hooks",
+		label: "Hooks",
+		icon: html`<span class="icon icon-wrench"></span>`,
+		page: true,
+	},
+	{
+		id: "skills",
+		label: "Skills",
+		icon: html`<span class="icon icon-sparkles"></span>`,
+		page: true,
+	},
+	{ group: "Systems" },
+	{
+		id: "sandboxes",
+		label: "Sandboxes",
+		icon: html`<span class="icon icon-cube"></span>`,
+		page: true,
+	},
+	{
+		id: "monitoring",
+		label: "Monitoring",
+		icon: html`<span class="icon icon-chart-bar"></span>`,
+		page: true,
+	},
+	{
+		id: "logs",
+		label: "Logs",
+		icon: html`<span class="icon icon-document"></span>`,
+		page: true,
 	},
 	{
 		id: "config",
@@ -96,25 +174,44 @@ var sections = [
 
 function getVisibleSections() {
 	var voiceEnabled = gon.get("voice_enabled");
-	return sections.filter((s) => s.id !== "voice" || voiceEnabled);
+	return sections.filter((s) => s.group || s.id !== "voice" || voiceEnabled);
+}
+
+/** Return only items with an id (no group headings). */
+function getSectionItems() {
+	return sections.filter((s) => s.id);
 }
 
 function SettingsSidebar() {
 	return html`<div class="settings-sidebar">
-		<div class="settings-sidebar-nav">
-			${getVisibleSections().map(
-				(s) => html`
+			<div class="settings-sidebar-header">
 				<button
-					key=${s.id}
-					class="settings-nav-item ${activeSection.value === s.id ? "active" : ""}"
+					class="settings-back-slot"
 					onClick=${() => {
-						navigate(`/settings/${s.id}`);
+						navigate(routes.chats);
 					}}
-				>
-					${s.icon}
-					${s.label}
-				</button>
-			`,
+					title="Back to chat sessions"
+			>
+				<span class="icon icon-chat"></span>
+				Back to Chats
+			</button>
+		</div>
+		<div class="settings-sidebar-nav">
+			${getVisibleSections().map((s) =>
+				s.group
+					? html`<div key=${s.group} class="settings-group-label">
+							${s.group}
+						</div>`
+					: html`<button
+							key=${s.id}
+							class="settings-nav-item ${activeSection.value === s.id ? "active" : ""}"
+							onClick=${() => {
+								navigate(settingsPath(s.id));
+							}}
+						>
+							${s.icon}
+							${s.label}
+						</button>`,
 			)}
 		</div>
 	</div>`;
@@ -146,7 +243,11 @@ function IdentitySection() {
 	var [userName, setUserName] = useState(id?.user_name || "");
 	var [soul, setSoul] = useState(id?.soul || "");
 	var [saving, setSaving] = useState(false);
+	var [emojiSaving, setEmojiSaving] = useState(false);
+	var [nameSaving, setNameSaving] = useState(false);
+	var [userNameSaving, setUserNameSaving] = useState(false);
 	var [saved, setSaved] = useState(false);
+	var [showFaviconReloadHint, setShowFaviconReloadHint] = useState(false);
 	var [error, setError] = useState(null);
 
 	// Sync state when identity loads asynchronously
@@ -159,6 +260,14 @@ function IdentitySection() {
 		setUserName(id.user_name || "");
 		setSoul(id.soul || "");
 	}, [id]);
+
+	function flashSaved() {
+		setSaved(true);
+		setTimeout(() => {
+			setSaved(false);
+			rerender();
+		}, 2000);
+	}
 
 	if (loading.value) {
 		return html`<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
@@ -195,12 +304,11 @@ function IdentitySection() {
 			setSaving(false);
 			if (res?.ok) {
 				identity.value = res.payload;
+				gon.set("identity", res.payload);
 				refreshGon();
-				setSaved(true);
-				setTimeout(() => {
-					setSaved(false);
-					rerender();
-				}, 2000);
+				var emojiChanged = (emoji.trim() || "") !== (id?.emoji || "").trim();
+				setShowFaviconReloadHint(emojiChanged && isSafariBrowser());
+				flashSaved();
 			} else {
 				setError(res?.error?.message || "Failed to save");
 			}
@@ -208,9 +316,85 @@ function IdentitySection() {
 		});
 	}
 
+	function onEmojiSelect(nextEmoji) {
+		setEmoji(nextEmoji);
+		setError(null);
+		setSaved(false);
+		setEmojiSaving(true);
+		sendRpc("agent.identity.update", { emoji: nextEmoji.trim() || "" }).then((res) => {
+			setEmojiSaving(false);
+			if (res?.ok) {
+				identity.value = res.payload;
+				setEmoji(res.payload?.emoji || "");
+				gon.set("identity", res.payload);
+				refreshGon();
+				var emojiChanged = (nextEmoji.trim() || "") !== (id?.emoji || "").trim();
+				setShowFaviconReloadHint(emojiChanged && isSafariBrowser());
+				flashSaved();
+			} else {
+				setError(res?.error?.message || "Failed to save emoji");
+			}
+			rerender();
+		});
+	}
+
+	function autoSaveNameField(field, value) {
+		if (saving || emojiSaving || nameSaving || userNameSaving) return;
+		var trimmed = value.trim();
+		var currentValue = (identity.value?.[field] || "").trim();
+		if (trimmed === currentValue) return;
+
+		if (!trimmed) {
+			setError(field === "name" ? "Agent name is required." : "Your name is required.");
+			return;
+		}
+
+		setError(null);
+		setSaved(false);
+		if (field === "name") {
+			setNameSaving(true);
+		} else {
+			setUserNameSaving(true);
+		}
+
+		var payload = {};
+		payload[field] = trimmed;
+		sendRpc("agent.identity.update", payload).then((res) => {
+			if (field === "name") {
+				setNameSaving(false);
+			} else {
+				setUserNameSaving(false);
+			}
+
+			if (res?.ok) {
+				identity.value = res.payload;
+				gon.set("identity", res.payload);
+				refreshGon();
+				setName(res.payload?.name || "");
+				setUserName(res.payload?.user_name || "");
+				flashSaved();
+			} else {
+				setError(res?.error?.message || "Failed to save");
+			}
+			rerender();
+		});
+	}
+
+	function onNameBlur() {
+		autoSaveNameField("name", name);
+	}
+
+	function onUserNameBlur() {
+		autoSaveNameField("user_name", userName);
+	}
+
 	function onResetSoul() {
 		setSoul("");
 		rerender();
+	}
+
+	function onReloadForFavicon() {
+		window.location.reload();
 	}
 
 	return html`<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
@@ -228,42 +412,49 @@ function IdentitySection() {
 				<h3 class="text-sm font-medium text-[var(--text-strong)]" style="margin-bottom:8px;">Agent</h3>
 				<p class="text-xs text-[var(--muted)]" style="margin:0 0 8px;">Saved to <code>IDENTITY.md</code> in your workspace root.</p>
 				<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;">
-					<div>
-						<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Name *</div>
-						<input type="text" class="provider-key-input" style="width:100%;"
-							value=${name} onInput=${(e) => setName(e.target.value)}
-							placeholder="e.g. Rex" />
-					</div>
-					<div>
-						<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Emoji</div>
-						<${EmojiPicker} value=${emoji} onChange=${setEmoji} />
-					</div>
+						<div>
+							<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Name *</div>
+							<input type="text" class="provider-key-input" style="width:100%;"
+								value=${name} onInput=${(e) => setName(e.target.value)} onBlur=${onNameBlur}
+								placeholder="e.g. Rex" />
+						</div>
+						<div>
+							<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Emoji</div>
+							<${EmojiPicker} value=${emoji} onChange=${setEmoji} onSelect=${onEmojiSelect} />
+						</div>
 					<div>
 						<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Creature</div>
 						<input type="text" class="provider-key-input" style="width:100%;"
 							value=${creature} onInput=${(e) => setCreature(e.target.value)}
 							placeholder="e.g. dog" />
 					</div>
-					<div>
-						<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Vibe</div>
-						<input type="text" class="provider-key-input" style="width:100%;"
-							value=${vibe} onInput=${(e) => setVibe(e.target.value)}
-							placeholder="e.g. chill" />
+						<div>
+							<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Vibe</div>
+							<input type="text" class="provider-key-input" style="width:100%;"
+								value=${vibe} onInput=${(e) => setVibe(e.target.value)}
+								placeholder="e.g. chill" />
+						</div>
 					</div>
+					${
+						showFaviconReloadHint
+							? html`<div class="mt-3 rounded border border-[var(--border)] bg-[var(--surface2)] p-2 text-xs text-[var(--muted)]">
+								favicon updates requires reload and may be cached for minutes, <button type="button" class="cursor-pointer bg-transparent p-0 text-xs text-[var(--text)] underline" onClick=${onReloadForFavicon}>requires reload</button>.
+							</div>`
+							: null
+					}
 				</div>
-			</div>
 
 			<!-- User section -->
 			<div>
 				<h3 class="text-sm font-medium text-[var(--text-strong)]" style="margin-bottom:8px;">User</h3>
 				<p class="text-xs text-[var(--muted)]" style="margin:0 0 8px;">Saved to <code>USER.md</code> in your workspace root.</p>
-				<div>
-					<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Your name *</div>
-					<input type="text" class="provider-key-input" style="width:100%;max-width:280px;"
-						value=${userName} onInput=${(e) => setUserName(e.target.value)}
-						placeholder="e.g. Alice" />
+					<div>
+						<div class="text-xs text-[var(--muted)]" style="margin-bottom:4px;">Your name *</div>
+						<input type="text" class="provider-key-input" style="width:100%;max-width:280px;"
+							value=${userName} onInput=${(e) => setUserName(e.target.value)} onBlur=${onUserNameBlur}
+							placeholder="e.g. Alice" />
+					</div>
 				</div>
-			</div>
 
 			<!-- Soul section -->
 			<div>
@@ -285,10 +476,10 @@ function IdentitySection() {
 				}
 			</div>
 
-			<div style="display:flex;align-items:center;gap:8px;">
-				<button type="submit" class="provider-btn" disabled=${saving}>
-					${saving ? "Saving\u2026" : "Save"}
-				</button>
+					<div style="display:flex;align-items:center;gap:8px;">
+						<button type="submit" class="provider-btn" disabled=${saving || emojiSaving || nameSaving || userNameSaving}>
+							${saving || emojiSaving || nameSaving || userNameSaving ? "Saving\u2026" : "Save"}
+						</button>
 				${saved ? html`<span class="text-xs" style="color:var(--accent);">Saved</span>` : null}
 				${error ? html`<span class="text-xs" style="color:var(--error);">${error}</span>` : null}
 			</div>
@@ -426,7 +617,13 @@ function EnvironmentSection() {
 										onConfirmUpdate(v.key);
 									}}>
 									<code style="font-size:0.8rem;font-family:var(--font-mono);">${v.key}</code>
-									<input type="password" class="provider-key-input" value=${updateValue}
+									<input type="password" class="provider-key-input"
+										name="env_update_value"
+										autocomplete="new-password"
+										autocorrect="off"
+										autocapitalize="off"
+										spellcheck="false"
+										value=${updateValue}
 										onInput=${(e) => setUpdateValue(e.target.value)}
 										placeholder="New value" style="flex:1" autofocus />
 									<button type="submit" class="provider-btn">Save</button>
@@ -439,11 +636,11 @@ function EnvironmentSection() {
 										<time datetime=${v.updated_at}>${v.updated_at}</time>
 									</div>
 								</div>
-								<div style="display:flex;gap:4px;">
-									<button class="provider-btn" onClick=${() => onStartUpdate(v.id)}>Update</button>
-									<button class="provider-btn provider-btn-danger"
-										onClick=${() => onDelete(v.id)}>Delete</button>
-								</div>`
+									<div style="display:flex;gap:4px;">
+										<button class="provider-btn provider-btn-sm" onClick=${() => onStartUpdate(v.id)}>Update</button>
+										<button class="provider-btn provider-btn-sm provider-btn-danger"
+											onClick=${() => onDelete(v.id)}>Delete</button>
+									</div>`
 						}
 					</div>`,
 					)}
@@ -457,10 +654,22 @@ function EnvironmentSection() {
 				<h3 class="text-sm font-medium text-[var(--text-strong)]" style="margin-bottom:8px;">Add Variable</h3>
 				<form onSubmit=${onAdd}>
 					<div style="display:flex;gap:8px;flex-wrap:wrap;">
-						<input type="text" class="provider-key-input" value=${newKey}
+						<input type="text" class="provider-key-input"
+							name="env_key"
+							autocomplete="off"
+							autocorrect="off"
+							autocapitalize="off"
+							spellcheck="false"
+							value=${newKey}
 							onInput=${(e) => setNewKey(e.target.value)}
 							placeholder="KEY_NAME" style="flex:1;min-width:120px;font-family:var(--font-mono);font-size:.8rem;" />
-						<input type="password" class="provider-key-input" value=${newValue}
+						<input type="password" class="provider-key-input"
+							name="env_value"
+							autocomplete="new-password"
+							autocorrect="off"
+							autocapitalize="off"
+							spellcheck="false"
+							value=${newValue}
 							onInput=${(e) => setNewValue(e.target.value)}
 							placeholder="Value" style="flex:2;min-width:200px;" />
 						<button type="submit" class="provider-btn" disabled=${saving || !newKey.trim()}>
@@ -483,6 +692,8 @@ function SecuritySection() {
 	var [authDisabled, setAuthDisabled] = useState(false);
 	var [localhostOnly, setLocalhostOnly] = useState(false);
 	var [hasPassword, setHasPassword] = useState(true);
+	var [hasPasskeys, setHasPasskeys] = useState(false);
+	var [setupComplete, setSetupComplete] = useState(false);
 	var [authLoading, setAuthLoading] = useState(true);
 
 	var [curPw, setCurPw] = useState("");
@@ -512,6 +723,27 @@ function SecuritySection() {
 		"operator.pairing": false,
 	});
 
+	function notifyAuthStatusChanged() {
+		window.dispatchEvent(new CustomEvent("moltis:auth-status-changed"));
+	}
+
+	// A credential added while localhost-bypass is active can immediately make the
+	// current session unauthenticated (no session cookie). Reload so middleware
+	// can route to /login in that transition.
+	function reloadIfAuthNowRequiresLogin() {
+		return fetch("/api/auth/status")
+			.then((r) => (r.ok ? r.json() : null))
+			.then((d) => {
+				var mustLogin = !!(d && d.auth_disabled === false && d.setup_required === false && d.authenticated === false);
+				if (mustLogin) {
+					window.location.reload();
+					return true;
+				}
+				return false;
+			})
+			.catch(() => false);
+	}
+
 	useEffect(() => {
 		fetch("/api/auth/status")
 			.then((r) => (r.ok ? r.json() : null))
@@ -519,6 +751,8 @@ function SecuritySection() {
 				if (d?.auth_disabled) setAuthDisabled(true);
 				if (d?.localhost_only) setLocalhostOnly(true);
 				if (d?.has_password === false) setHasPassword(false);
+				if (d?.has_passkeys === true) setHasPasskeys(true);
+				if (d?.setup_complete) setSetupComplete(true);
 				if (d?.passkey_origins) setPasskeyOrigins(d.passkey_origins);
 				setAuthLoading(false);
 				rerender();
@@ -531,6 +765,7 @@ function SecuritySection() {
 			.then((r) => (r.ok ? r.json() : { passkeys: [] }))
 			.then((d) => {
 				setPasskeys(d.passkeys || []);
+				setHasPasskeys((d.passkeys || []).length > 0);
 				setPkLoading(false);
 				rerender();
 			})
@@ -566,15 +801,26 @@ function SecuritySection() {
 			body: JSON.stringify(payload),
 		})
 			.then((r) => {
-				if (r.ok) {
-					setPwMsg(hasPassword ? "Password changed." : "Password set.");
-					setCurPw("");
-					setNewPw("");
-					setConfirmPw("");
-					setHasPassword(true);
-				} else return r.text().then((t) => setPwErr(t));
-				setPwSaving(false);
-				rerender();
+				if (!r.ok) {
+					return r.text().then((t) => {
+						setPwErr(t);
+						setPwSaving(false);
+						rerender();
+					});
+				}
+
+				setPwMsg(hasPassword ? "Password changed." : "Password set.");
+				setCurPw("");
+				setNewPw("");
+				setConfirmPw("");
+				setHasPassword(true);
+				setSetupComplete(true);
+				setAuthDisabled(false);
+				return reloadIfAuthNowRequiresLogin().then((reloaded) => {
+					if (!reloaded) notifyAuthStatusChanged();
+					setPwSaving(false);
+					rerender();
+				});
 			})
 			.catch((err) => {
 				setPwErr(err.message);
@@ -626,13 +872,20 @@ function SecuritySection() {
 			.then((r) => {
 				if (r.ok) {
 					setPkName("");
-					return fetch("/api/auth/passkeys")
-						.then((r2) => r2.json())
-						.then((d) => {
-							setPasskeys(d.passkeys || []);
-							setPkMsg("Passkey added.");
-							rerender();
-						});
+					return reloadIfAuthNowRequiresLogin().then((reloaded) => {
+						if (reloaded) return;
+						return fetch("/api/auth/passkeys")
+							.then((r2) => r2.json())
+							.then((d) => {
+								setPasskeys(d.passkeys || []);
+								setHasPasskeys((d.passkeys || []).length > 0);
+								setSetupComplete(true);
+								setAuthDisabled(false);
+								setPkMsg("Passkey added.");
+								notifyAuthStatusChanged();
+								rerender();
+							});
+					});
 				} else
 					return r.text().then((t) => {
 						setPkMsg(t);
@@ -679,6 +932,8 @@ function SecuritySection() {
 			.then(() => fetch("/api/auth/passkeys").then((r) => r.json()))
 			.then((d) => {
 				setPasskeys(d.passkeys || []);
+				setHasPasskeys((d.passkeys || []).length > 0);
+				notifyAuthStatusChanged();
 				rerender();
 			});
 	}
@@ -775,18 +1030,13 @@ function SecuritySection() {
 		</div>`;
 	}
 
-	if (authDisabled) {
-		var isScary = !localhostOnly;
+	if (authDisabled && !localhostOnly) {
 		return html`<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
 			<h2 class="text-lg font-medium text-[var(--text-strong)]">Security</h2>
 			<div style="max-width:600px;padding:12px 16px;border-radius:6px;border:1px solid var(--error);background:color-mix(in srgb, var(--error) 5%, transparent);">
 				<strong style="color:var(--error);">Authentication is disabled</strong>
 				<p class="text-xs text-[var(--muted)]" style="margin:8px 0 0;">
-					${
-						isScary
-							? "Anyone with network access can control moltis and your computer. Set up a password to protect your instance."
-							: "Authentication has been removed. While localhost-only access is safe, you should set up a password before exposing moltis to the network."
-					}
+					Anyone with network access can control moltis and your computer. Set up a password to protect your instance.
 				</p>
 				<button type="button" class="provider-btn" style="margin-top:10px;"
 					onClick=${() => {
@@ -800,11 +1050,23 @@ function SecuritySection() {
 		<h2 class="text-lg font-medium text-[var(--text-strong)]">Security</h2>
 
 		${
-			localhostOnly && !hasPassword
+			authDisabled && localhostOnly
+				? html`<div style="max-width:600px;padding:12px 16px;border-radius:6px;border:1px solid var(--error);background:color-mix(in srgb, var(--error) 5%, transparent);">
+					<strong style="color:var(--error);">Authentication is disabled</strong>
+					<p class="text-xs text-[var(--muted)]" style="margin:8px 0 0;">
+						Localhost-only access is safe, but localhost bypass is active. Until you add a password or passkey, this browser has full access and Sign out has no effect.
+						Add credentials below to require login on localhost and before exposing Moltis to your network.
+					</p>
+				</div>`
+				: null
+		}
+
+		${
+			localhostOnly && !hasPassword && !hasPasskeys && !authDisabled
 				? html`<div class="alert-info-text max-w-form">
-					<span class="alert-label-info">Note:</span>${" "}
-					Moltis is running on localhost, so you have full access without a password.
-					Set a password before exposing moltis to the network.
+					<span class="alert-label-info">Note: </span>
+					Localhost bypass is active. Until you add a password or passkey, this browser has full access and Sign out has no effect.
+					Add credentials to require login on localhost and before exposing Moltis to your network.
 				</div>`
 				: null
 		}
@@ -866,16 +1128,16 @@ function SecuritySection() {
 									<input type="text" class="provider-key-input" value=${editingPkName}
 										onInput=${(e) => setEditingPkName(e.target.value)}
 										style="flex:1" autofocus />
-									<button type="submit" class="provider-btn">Save</button>
-									<button type="button" class="provider-btn" onClick=${onCancelRename}>Cancel</button>
+									<button type="submit" class="provider-btn provider-btn-sm">Save</button>
+									<button type="button" class="provider-btn provider-btn-sm provider-btn-secondary" onClick=${onCancelRename}>Cancel</button>
 								</form>`
 								: html`<div style="flex:1;min-width:0;">
 									<div class="provider-item-name" style="font-size:.85rem;">${pk.name}</div>
-									<div style="font-size:.7rem;color:var(--muted);margin-top:2px;">${pk.created_at}</div>
+									<div style="font-size:.7rem;color:var(--muted);margin-top:2px;"><time datetime=${pk.created_at}>${pk.created_at}</time></div>
 								</div>
 								<div style="display:flex;gap:4px;">
-									<button class="provider-btn" onClick=${() => onStartRename(pk.id, pk.name)}>Rename</button>
-									<button class="provider-btn provider-btn-danger"
+									<button class="provider-btn provider-btn-sm provider-btn-secondary" onClick=${() => onStartRename(pk.id, pk.name)}>Rename</button>
+									<button class="provider-btn provider-btn-sm provider-btn-danger"
 										onClick=${() => onRemovePasskey(pk.id)}>Remove</button>
 								</div>`
 						}
@@ -922,7 +1184,7 @@ function SecuritySection() {
 							<div class="provider-item-name" style="font-size:.85rem;">${ak.label}</div>
 							<div style="font-size:.7rem;color:var(--muted);margin-top:2px;display:flex;gap:12px;flex-wrap:wrap;">
 								<span style="font-family:var(--font-mono);">${ak.key_prefix}...</span>
-								<span>${ak.created_at}</span>
+								<span><time datetime=${ak.created_at}>${ak.created_at}</time></span>
 								${ak.scopes ? html`<span style="color:var(--accent);">${ak.scopes.join(", ")}</span>` : html`<span style="color:var(--accent);">Full access</span>`}
 							</div>
 						</div>
@@ -991,8 +1253,10 @@ function SecuritySection() {
 			}
 		</div>
 
-		<!-- Danger zone -->
-		<div style="max-width:600px;margin-top:8px;border-top:1px solid var(--error);padding-top:16px;">
+		<!-- Danger zone (only when auth has been set up) -->
+		${
+			setupComplete
+				? html`<div style="max-width:600px;margin-top:8px;border-top:1px solid var(--error);padding-top:16px;">
 			<h3 class="text-sm font-medium" style="color:var(--error);margin-bottom:8px;">Danger Zone</h3>
 			<div style="padding:12px 16px;border:1px solid var(--error);border-radius:6px;background:color-mix(in srgb, var(--error) 5%, transparent);">
 				<strong class="text-sm" style="color:var(--text-strong);">Remove all authentication</strong>
@@ -1016,7 +1280,9 @@ function SecuritySection() {
 						onClick=${onResetAuth}>Remove all authentication</button>`
 				}
 			</div>
-		</div>
+		</div>`
+				: ""
+		}
 	</div>`;
 }
 
@@ -1302,7 +1568,7 @@ function ConfigSection() {
 	return html`<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
 		<h2 class="text-lg font-medium text-[var(--text-strong)]">Configuration</h2>
 		<p class="text-xs text-[var(--muted)] leading-relaxed" style="max-width:700px;margin:0;">
-			Edit the full moltis configuration. This includes server, tools, providers, auth, and all other settings.
+			Edit the full moltis configuration. This includes server, tools, LLM providers, auth, and all other settings.
 			Test your changes before saving. Changes require a restart to take effect.
 			<a href="https://moltis.dev/docs/configuration" target="_blank" rel="noopener"
 				style="color:var(--accent);text-decoration:underline;">View documentation \u2197</a>
@@ -1770,11 +2036,22 @@ function VoiceSection() {
 				if (res?.ok && res.payload?.audio) {
 					// Decode base64 audio and play it
 					var bytes = decodeBase64Safe(res.payload.audio);
-					var blob = new Blob([bytes], { type: res.payload.content_type || "audio/mpeg" });
+					var audioMime = res.payload.mimeType || res.payload.content_type || "audio/mpeg";
+					console.log(
+						"[TTS] audio received: %d bytes, mime=%s, format=%s",
+						bytes.length,
+						audioMime,
+						res.payload.format,
+					);
+					var blob = new Blob([bytes], { type: audioMime });
 					var url = URL.createObjectURL(blob);
 					var audio = new Audio(url);
+					audio.onerror = (e) => {
+						console.error("[TTS] audio element error:", audio.error?.message || e);
+						URL.revokeObjectURL(url);
+					};
 					audio.onended = () => URL.revokeObjectURL(url);
-					audio.play().catch(() => undefined);
+					audio.play().catch((e) => console.error("[TTS] play() failed:", e));
 					setVoiceTestResults((prev) => ({
 						...prev,
 						[providerId]: { success: true, error: null },
@@ -1828,20 +2105,36 @@ function VoiceSection() {
 								body: audioBlob,
 							},
 						);
-						var sttRes = await resp.json();
+						console.log("[STT] upload response: status=%d ok=%s", resp.status, resp.ok);
+						if (resp.ok) {
+							var sttRes = await resp.json();
 
-						if (sttRes.ok && sttRes.transcription?.text) {
-							setVoiceTestResults((prev) => ({
-								...prev,
-								[providerId]: { text: sttRes.transcription.text, error: null },
-							}));
+							if (sttRes.ok && sttRes.transcription?.text) {
+								setVoiceTestResults((prev) => ({
+									...prev,
+									[providerId]: { text: sttRes.transcription.text, error: null },
+								}));
+							} else {
+								setVoiceTestResults((prev) => ({
+									...prev,
+									[providerId]: {
+										text: null,
+										error: sttRes.transcriptionError || sttRes.error || "STT test failed",
+									},
+								}));
+							}
 						} else {
+							var errBody = await resp.text();
+							console.error("[STT] upload failed: status=%d body=%s", resp.status, errBody);
+							var errMsg = "STT test failed";
+							try {
+								errMsg = JSON.parse(errBody)?.error || errMsg;
+							} catch (_e) {
+								// not JSON
+							}
 							setVoiceTestResults((prev) => ({
 								...prev,
-								[providerId]: {
-									text: null,
-									error: sttRes.transcriptionError || sttRes.error || "STT test failed",
-								},
+								[providerId]: { text: null, error: `${errMsg} (HTTP ${resp.status})` },
 							}));
 						}
 					} catch (fetchErr) {
@@ -2003,7 +2296,14 @@ function VoiceProviderRow({ provider, meta, type, saving, testState, testResult,
 			</div>`
 					: null
 			}
-			${testResult?.error ? html`<span class="text-xs text-[var(--error)]">${testResult.error}</span>` : null}
+			${
+				testResult?.error
+					? html`<div class="voice-error-result">
+				<span class="icon icon-md icon-x-circle"></span>
+				<span>${testResult.error}</span>
+			</div>`
+					: null
+			}
 		</div>
 		<div style="display:flex;align-items:center;gap:8px;">
 			<button class="provider-btn provider-btn-secondary provider-btn-sm" onClick=${onConfigure}>
@@ -2934,6 +3234,41 @@ function NotificationsSection() {
 	</div>`;
 }
 
+// ── Page-section init/teardown map ──────────────────────────
+
+var pageSectionHandlers = {
+	crons: {
+		init: (container) => initCrons(container, null, { syncRoute: false }),
+		teardown: teardownCrons,
+	},
+	providers: { init: initProviders, teardown: teardownProviders },
+	channels: { init: initChannels, teardown: teardownChannels },
+	mcp: { init: initMcp, teardown: teardownMcp },
+	hooks: { init: initHooks, teardown: teardownHooks },
+	skills: { init: initSkills, teardown: teardownSkills },
+	sandboxes: { init: initImages, teardown: teardownImages },
+	monitoring: {
+		init: (container) => initMonitoring(container, null, { syncPath: false }),
+		teardown: teardownMonitoring,
+	},
+	logs: { init: initLogs, teardown: teardownLogs },
+};
+
+/** Wrapper that mounts a page init/teardown pair into a ref div. */
+function PageSection({ initFn, teardownFn }) {
+	var ref = useRef(null);
+	useEffect(() => {
+		if (ref.current) initFn(ref.current);
+		return () => {
+			if (teardownFn) teardownFn();
+		};
+	}, []);
+	return html`<div
+		ref=${ref}
+		class="flex-1 flex flex-col min-w-0 overflow-hidden"
+	/>`;
+}
+
 // ── Main layout ──────────────────────────────────────────────
 
 // ── Network section ──────────────────────────────────────────
@@ -3081,9 +3416,11 @@ function SettingsPage() {
 	}, []);
 
 	var section = activeSection.value;
+	var ps = pageSectionHandlers[section];
 
 	return html`<div class="settings-layout">
 		<${SettingsSidebar} />
+		${ps ? html`<${PageSection} key=${section} initFn=${ps.init} teardownFn=${ps.teardown} />` : null}
 		${section === "identity" ? html`<${IdentitySection} />` : null}
 		${section === "memory" ? html`<${MemorySection} />` : null}
 		${section === "environment" ? html`<${EnvironmentSection} />` : null}
@@ -3096,17 +3433,19 @@ function SettingsPage() {
 	</div>`;
 }
 
+var DEFAULT_SECTION = "identity";
+
 registerPrefix(
-	"/settings",
+	routes.settings,
 	(container, param) => {
 		mounted = true;
 		containerRef = container;
 		container.style.cssText = "flex-direction:row;padding:0;overflow:hidden;";
-		var isValidSection = param && sections.some((s) => s.id === param);
-		var section = isValidSection ? param : "identity";
+		var isValidSection = param && getSectionItems().some((s) => s.id === param);
+		var section = isValidSection ? param : DEFAULT_SECTION;
 		activeSection.value = section;
 		if (!isValidSection) {
-			history.replaceState(null, "", `/settings/${section}`);
+			history.replaceState(null, "", settingsPath(section));
 		}
 		render(html`<${SettingsPage} />`, container);
 		fetchIdentity();
@@ -3117,6 +3456,6 @@ registerPrefix(
 		containerRef = null;
 		identity.value = null;
 		loading.value = true;
-		activeSection.value = "identity";
+		activeSection.value = DEFAULT_SECTION;
 	},
 );

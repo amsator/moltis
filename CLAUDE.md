@@ -16,6 +16,11 @@ https://docs.openclaw.ai and its code is at https://github.com/openclaw/openclaw
 All code you write must have tests with high coverage. Always check for Security
 to make code safe.
 
+### Repo Timeout Override
+
+- If a command runs longer than 15 minutes, stop it, capture logs/context, and
+  check with the user before retrying.
+
 ## Cargo Features
 
 When adding a new feature behind a cargo feature flag, **always enable it by

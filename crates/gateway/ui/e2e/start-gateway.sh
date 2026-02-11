@@ -52,5 +52,5 @@ fi
 if [ -n "${BINARY}" ]; then
 	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}"
 else
-	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}"
+	exec cargo +nightly run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}"
 fi

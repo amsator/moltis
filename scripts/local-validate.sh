@@ -151,10 +151,10 @@ if [[ "$(uname -s)" == "Darwin" ]] && ! command -v nvcc >/dev/null 2>&1; then
     lint_cmd="cargo +nightly clippy --workspace -- -D warnings"
   fi
   if [[ -z "${LOCAL_VALIDATE_TEST_CMD:-}" ]]; then
-    test_cmd="cargo test"
+    test_cmd="cargo +nightly test"
   fi
   if [[ -z "${LOCAL_VALIDATE_COVERAGE_CMD:-}" ]]; then
-    coverage_cmd="cargo llvm-cov --workspace --html"
+    coverage_cmd="cargo +nightly llvm-cov --workspace --html"
   fi
   echo "Detected macOS without nvcc; using non-CUDA local validation commands." >&2
   echo "Override with LOCAL_VALIDATE_LINT_CMD / LOCAL_VALIDATE_TEST_CMD if needed." >&2

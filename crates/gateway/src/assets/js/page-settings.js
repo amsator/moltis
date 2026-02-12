@@ -77,7 +77,7 @@ var sections = [
 	{
 		id: "agents",
 		label: "Agents",
-		icon: html`<span class="icon icon-person"></span>`,
+		icon: html`<span class="icon icon-user-group"></span>`,
 		page: true,
 	},
 	{

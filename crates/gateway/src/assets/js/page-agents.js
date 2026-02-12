@@ -264,14 +264,23 @@ function AgentsPage() {
 
 	function fetchAgents() {
 		setLoading(true);
-		sendRpc("agents.list", {}).then((res) => {
-			setLoading(false);
-			if (res?.ok) {
-				setAgents(res.payload || []);
-			} else {
-				setError(res?.error?.message || "Failed to load agents");
-			}
-		});
+		var attempts = 0;
+		function load() {
+			sendRpc("agents.list", {}).then((res) => {
+				if (res?.error?.message === "WebSocket not connected" && attempts < 30) {
+					attempts += 1;
+					window.setTimeout(load, 200);
+					return;
+				}
+				setLoading(false);
+				if (res?.ok) {
+					setAgents(res.payload || []);
+				} else {
+					setError(res?.error?.message || "Failed to load agents");
+				}
+			});
+		}
+		load();
 	}
 
 	useEffect(() => {

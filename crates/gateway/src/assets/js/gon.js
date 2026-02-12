@@ -1,14 +1,15 @@
 // ── Server-injected data (gon pattern) ────────────────────
 //
-// The server injects `window.__MOLTIS__ = { ... }` into every
-// page <head> before any module script runs.  This module
-// provides typed access, runtime updates, and a refresh
-// mechanism that re-fetches the data from `/api/gon`.
+// The server injects a `<script type="application/json" id="__MOLTIS_GON__">`
+// blob into every page <head> before any module script runs.
+// This module provides typed access, runtime updates, and a
+// refresh mechanism that re-fetches the data from `/api/gon`.
 //
 // Register listeners with `onChange(key, fn)` to react when
 // a key is updated (via `set()` or `refresh()`).
 
-var gon = window.__MOLTIS__ || {};
+var gon = JSON.parse(document.getElementById("__MOLTIS_GON__")?.textContent || "{}");
+window.__MOLTIS__ = gon;
 var listeners = {};
 
 export function get(key) {

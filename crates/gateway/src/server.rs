@@ -5711,11 +5711,14 @@ mod tests {
         assert!(html.contains("/assets/v/test/js/onboarding-app.js"));
         assert!(!html.contains("/assets/v/test/js/app.js"));
         assert!(!html.contains("/manifest.json"));
-        assert!(html.contains("<script nonce=\"nonce-123\">"));
+        // Theme init is now an external script (no nonce).
+        assert!(html.contains("<script src=\"/assets/v/test/js/theme-init.js\"></script>"));
+        // Import map still requires a nonce.
         assert!(html.contains("<script nonce=\"nonce-123\" type=\"importmap\">"));
-        assert!(html.contains(
-            "<script nonce=\"nonce-123\" type=\"module\" src=\"/assets/v/test/js/onboarding-app.js\">"
-        ));
+        // External module script does NOT need a nonce.
+        assert!(
+            html.contains("<script type=\"module\" src=\"/assets/v/test/js/onboarding-app.js\">")
+        );
     }
 
     #[cfg(feature = "web-ui")]
@@ -5821,10 +5824,22 @@ mod tests {
         assert!(html.contains(
             "<link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/assets/v/test/icons/icon-72.png\">"
         ));
-        assert!(html.contains("<script nonce=\"nonce-abc\">window.__MOLTIS__={\"identity\":{\"name\":\"moltis\"}};</script>"));
+        // Gon data is now a non-executable JSON blob.
         assert!(html.contains(
-            "<script nonce=\"nonce-abc\" type=\"module\" src=\"/assets/v/test/js/login-app.js\"></script>"
+            "<script type=\"application/json\" id=\"__MOLTIS_GON__\">{\"identity\":{\"name\":\"moltis\"}}</script>"
         ));
+        // External module script does NOT need a nonce.
+        assert!(
+            html.contains(
+                "<script type=\"module\" src=\"/assets/v/test/js/login-app.js\"></script>"
+            )
+        );
+        // Theme init is external.
+        assert!(html.contains("<script src=\"/assets/v/test/js/theme-init.js\"></script>"));
+        // Inline favicon script was removed.
+        assert!(!html.contains("var svg="));
+        // Import map still has nonce.
+        assert!(html.contains("<script nonce=\"nonce-abc\" type=\"importmap\">"));
     }
 
     #[cfg(feature = "web-ui")]
@@ -6136,14 +6151,21 @@ mod tests {
             Ok(html) => html,
             Err(e) => panic!("failed to render index template: {e}"),
         };
-        assert!(index_html.contains(&format!("<script nonce=\"{nonce}\">!function()")));
-        assert!(index_html.contains(&format!(
-            "<script nonce=\"{nonce}\">window.__MOLTIS__={{}};</script>"
-        )));
+        // Theme init is now an external script (no nonce needed, allowed by 'self').
+        assert!(index_html.contains("<script src=\"/assets/v/test/js/theme-init.js\"></script>"));
+        // Gon data is a non-executable JSON blob (no nonce needed).
+        assert!(index_html.contains("<script type=\"application/json\" id=\"__MOLTIS_GON__\">"));
+        // Inline favicon script was removed (handled by app.js).
+        assert!(!index_html.contains("var svg="));
+        // Import map still requires a nonce.
         assert!(index_html.contains(&format!("<script nonce=\"{nonce}\" type=\"importmap\">")));
-        assert!(index_html.contains(&format!(
-            "<script nonce=\"{nonce}\" type=\"module\" src=\"/assets/v/test/js/app.js\"></script>"
-        )));
+        // External module script does NOT need a nonce (allowed by 'self').
+        assert!(
+            index_html
+                .contains("<script type=\"module\" src=\"/assets/v/test/js/app.js\"></script>")
+        );
+        // Inline title-update script was removed (handled by app.js).
+        assert!(!index_html.contains("document.title=a}()"));
 
         let onboarding_template = OnboardingHtmlTemplate {
             build_ts: "dev",
@@ -6155,9 +6177,18 @@ mod tests {
             Ok(html) => html,
             Err(e) => panic!("failed to render onboarding template: {e}"),
         };
-        assert!(onboarding_html.contains(&format!(
-            "<script nonce=\"{nonce}\" type=\"module\" src=\"/assets/v/test/js/onboarding-app.js\"></script>"
-        )));
+        // Onboarding: external module script does NOT need a nonce.
+        assert!(onboarding_html.contains(
+            "<script type=\"module\" src=\"/assets/v/test/js/onboarding-app.js\"></script>"
+        ));
+        // Onboarding: theme init is external.
+        assert!(
+            onboarding_html.contains("<script src=\"/assets/v/test/js/theme-init.js\"></script>")
+        );
+        // Onboarding: import map still has nonce.
+        assert!(
+            onboarding_html.contains(&format!("<script nonce=\"{nonce}\" type=\"importmap\">"))
+        );
     }
 
     #[cfg(feature = "web-ui")]

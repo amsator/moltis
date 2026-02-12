@@ -4,6 +4,7 @@
 var CACHE_NAME = "moltis-v2";
 var STATIC_ASSETS = [
   "/manifest.json",
+  "/assets/js/theme-init.js",
   "/assets/css/base.css",
   "/assets/css/layout.css",
   "/assets/css/chat.css",

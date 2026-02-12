@@ -6,6 +6,7 @@
 import { html } from "htm/preact";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
+import { EmojiPicker } from "./emoji-picker.js";
 import { refresh as refreshGon } from "./gon.js";
 import { sendRpc } from "./helpers.js";
 import { navigate } from "./router.js";
@@ -136,17 +137,10 @@ function AgentForm({ agent, onSave, onCancel }) {
 				/>
 			</label>
 
-			<label class="flex flex-col gap-1">
+			<div class="flex flex-col gap-1">
 				<span class="text-xs text-[var(--muted)]">Emoji</span>
-				<input
-					type="text"
-					class="provider-key-input"
-					value=${emoji}
-					onInput=${(e) => setEmoji(e.target.value)}
-					placeholder="\u270D\uFE0F"
-					maxLength="8"
-				/>
-			</label>
+				<${EmojiPicker} value=${emoji} onChange=${setEmoji} />
+			</div>
 
 			<label class="flex flex-col gap-1">
 				<span class="text-xs text-[var(--muted)]">Creature</span>
@@ -318,18 +312,16 @@ function AgentsPage() {
 	}
 
 	return html`<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
-		<div class="flex items-center justify-between" style="max-width:600px;">
-			<div>
-				<h2 class="text-lg font-medium text-[var(--text-strong)]">Agents</h2>
-				<p class="text-xs text-[var(--muted)] leading-relaxed mt-1">
-					Create agent personas with different identities and personalities.
-					Each agent has its own memory and system prompt.
-				</p>
-			</div>
-			<button class="provider-btn" onClick=${() => setEditing("new")}>
+		<div class="flex items-center gap-3">
+			<h2 class="text-lg font-medium text-[var(--text-strong)]">Agents</h2>
+			<button class="provider-btn" style="font-size:0.75rem;padding:4px 10px;" onClick=${() => setEditing("new")}>
 				New Agent
 			</button>
 		</div>
+		<p class="text-xs text-[var(--muted)] leading-relaxed" style="max-width:600px;margin:0;">
+			Create agent personas with different identities and personalities.
+			Each agent has its own memory and system prompt.
+		</p>
 
 		${error && html`<span class="text-xs" style="color:var(--error);">${error}</span>`}
 

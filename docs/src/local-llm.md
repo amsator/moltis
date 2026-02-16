@@ -129,11 +129,7 @@ gpu_layers = 99  # Offload all layers to GPU
 
 ### CUDA (NVIDIA)
 
-Requires building with the `local-llm-cuda` feature:
-
-```bash
-cargo build --release --features local-llm-cuda
-```
+CUDA acceleration is currently not supported.
 
 ## Limitations
 
@@ -174,7 +170,7 @@ possible.
 
 ### Slow inference
 
-- Enable GPU acceleration (Metal on macOS, CUDA on Linux)
+- Enable GPU acceleration (Metal on macOS)
 - Try a smaller/more quantized model
 - Reduce context size in config
 

@@ -196,7 +196,6 @@ pub fn log_system_info() {
         total_ram_gb = sys.total_ram_gb(),
         available_ram_gb = sys.available_ram_gb(),
         has_metal = sys.has_metal,
-        has_cuda = sys.has_cuda,
         is_apple_silicon = sys.is_apple_silicon,
         tier = %tier,
         best_backend = ?best_backend,

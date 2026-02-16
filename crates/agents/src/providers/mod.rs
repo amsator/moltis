@@ -702,6 +702,44 @@ impl DynamicModelDiscovery for OpenAiCodexDiscovery {
     }
 }
 
+#[cfg(feature = "provider-openai-codex")]
+struct OpenCodeDiscovery;
+
+#[cfg(feature = "provider-openai-codex")]
+impl DynamicModelDiscovery for OpenCodeDiscovery {
+    fn provider_name(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn is_enabled_and_authenticated(&self, config: &ProvidersConfig) -> bool {
+        config.is_enabled(self.provider_name()) && openai_codex::has_stored_tokens()
+    }
+
+    fn configured_models(&self, config: &ProvidersConfig) -> Vec<String> {
+        configured_models_for_provider(config, self.provider_name())
+    }
+
+    fn should_fetch_models(&self, config: &ProvidersConfig) -> bool {
+        should_fetch_models(config, self.provider_name())
+    }
+
+    fn available_models(&self) -> Vec<DiscoveredModel> {
+        openai_codex::available_models()
+    }
+
+    fn live_models(&self) -> anyhow::Result<Vec<DiscoveredModel>> {
+        openai_codex::live_models()
+    }
+
+    fn build_provider(&self, model_id: String) -> Arc<dyn LlmProvider> {
+        Arc::new(openai_codex::OpenAiCodexProvider::new(model_id))
+    }
+
+    fn display_name(&self, _model_id: &str, discovered: &str) -> String {
+        format!("{discovered} (OpenCode)")
+    }
+}
+
 #[cfg(feature = "provider-github-copilot")]
 struct GitHubCopilotDiscovery;
 
@@ -980,6 +1018,7 @@ impl ProviderRegistry {
         #[cfg(feature = "provider-openai-codex")]
         {
             reg.register_openai_codex_providers(config);
+            reg.register_opencode_providers(config);
         }
 
         #[cfg(feature = "provider-github-copilot")]
@@ -1129,6 +1168,17 @@ impl ProviderRegistry {
     #[cfg(feature = "provider-openai-codex")]
     fn register_openai_codex_providers(&mut self, config: &ProvidersConfig) {
         let source = OpenAiCodexDiscovery;
+        let catalog = if source.should_fetch_models(config) {
+            source.available_models()
+        } else {
+            Vec::new()
+        };
+        self.register_dynamic_source_models(&source, config, catalog);
+    }
+
+    #[cfg(feature = "provider-openai-codex")]
+    fn register_opencode_providers(&mut self, config: &ProvidersConfig) {
+        let source = OpenCodeDiscovery;
         let catalog = if source.should_fetch_models(config) {
             source.available_models()
         } else {

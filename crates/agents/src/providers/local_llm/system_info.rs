@@ -13,8 +13,6 @@ pub struct SystemInfo {
     pub available_ram_bytes: u64,
     /// Whether Metal GPU acceleration is available (macOS).
     pub has_metal: bool,
-    /// Whether CUDA GPU acceleration is available (NVIDIA).
-    pub has_cuda: bool,
     /// Whether running on Apple Silicon (M1/M2/M3/etc).
     pub is_apple_silicon: bool,
 }
@@ -34,14 +32,10 @@ impl SystemInfo {
         // Metal detection: compile-time check for macOS + runtime check
         let has_metal = cfg!(target_os = "macos") && cfg!(feature = "local-llm-metal");
 
-        // CUDA detection: compile-time feature check
-        let has_cuda = cfg!(feature = "local-llm-cuda");
-
         Self {
             total_ram_bytes,
             available_ram_bytes,
             has_metal,
-            has_cuda,
             is_apple_silicon,
         }
     }
@@ -76,7 +70,7 @@ impl SystemInfo {
     /// Whether GPU acceleration is available.
     #[must_use]
     pub fn has_gpu(&self) -> bool {
-        self.has_metal || self.has_cuda
+        self.has_metal
     }
 }
 
@@ -120,7 +114,6 @@ mod tests {
             total_ram_bytes: 16 * 1024 * 1024 * 1024, // 16 GB
             available_ram_bytes: 8 * 1024 * 1024 * 1024,
             has_metal: false,
-            has_cuda: false,
             is_apple_silicon: false,
         };
         assert_eq!(info.total_ram_gb(), 16);
@@ -133,7 +126,6 @@ mod tests {
             total_ram_bytes: gb * 1024 * 1024 * 1024,
             available_ram_bytes: 0,
             has_metal: false,
-            has_cuda: false,
             is_apple_silicon: false,
         };
 
@@ -153,7 +145,6 @@ mod tests {
             total_ram_bytes: 0,
             available_ram_bytes: 0,
             has_metal: true,
-            has_cuda: false,
             is_apple_silicon: true,
         };
         assert!(info.has_gpu());
@@ -162,16 +153,14 @@ mod tests {
             total_ram_bytes: 0,
             available_ram_bytes: 0,
             has_metal: false,
-            has_cuda: true,
             is_apple_silicon: false,
         };
-        assert!(info.has_gpu());
+        assert!(!info.has_gpu());
 
         let info = SystemInfo {
             total_ram_bytes: 0,
             available_ram_bytes: 0,
             has_metal: false,
-            has_cuda: false,
             is_apple_silicon: false,
         };
         assert!(!info.has_gpu());

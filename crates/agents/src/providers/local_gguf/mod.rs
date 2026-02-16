@@ -766,7 +766,6 @@ pub fn log_system_info_and_suggestions() {
         total_ram_gb = sys.total_ram_gb(),
         available_ram_gb = sys.available_ram_gb(),
         has_metal = sys.has_metal,
-        has_cuda = sys.has_cuda,
         tier = %tier,
         "local-llm system info"
     );
@@ -829,7 +828,6 @@ mod tests {
             total_ram_bytes: 16 * 1024 * 1024 * 1024,
             available_ram_bytes: 8 * 1024 * 1024 * 1024,
             has_metal: false,
-            has_cuda: false,
             is_apple_silicon: false,
         };
         let tier = sys.memory_tier();
@@ -855,7 +853,6 @@ mod tests {
             total_ram_bytes: 16 * 1024 * 1024 * 1024,
             available_ram_bytes: 8 * 1024 * 1024 * 1024,
             has_metal: true,
-            has_cuda: false,
             is_apple_silicon: true,
         };
         let tier = sys.memory_tier();

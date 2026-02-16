@@ -94,7 +94,6 @@ default = [
 file-watcher = ["moltis-memory/file-watcher", "moltis-skills/file-watcher"]
 local-embeddings = ["moltis-memory/local-embeddings"]
 local-llm = ["moltis-agents/local-llm"]
-local-llm-cuda = ["moltis-agents/local-llm-cuda"]
 local-llm-metal = ["moltis-agents/local-llm-metal"]
 metrics = ["dep:moltis-metrics", "moltis-metrics/sqlite"]
 prometheus = ["metrics", "moltis-metrics/prometheus"]

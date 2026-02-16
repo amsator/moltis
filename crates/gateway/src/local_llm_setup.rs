@@ -604,8 +604,6 @@ impl LocalLlmService for LiveLocalLlmService {
             "name": "GGUF (llama.cpp)",
             "description": if sys.is_apple_silicon {
                 "Cross-platform, Metal GPU acceleration"
-            } else if sys.has_cuda {
-                "Cross-platform, CUDA GPU acceleration"
             } else {
                 "Cross-platform, CPU inference"
             },
@@ -633,8 +631,6 @@ impl LocalLlmService for LiveLocalLlmService {
             "MLX recommended (native Apple Silicon optimization)"
         } else if sys.is_apple_silicon {
             "GGUF with Metal (install mlx-lm for native MLX)"
-        } else if sys.has_cuda {
-            "GGUF with CUDA acceleration"
         } else {
             "GGUF (CPU inference)"
         };
@@ -643,7 +639,6 @@ impl LocalLlmService for LiveLocalLlmService {
             "totalRamGb": sys.total_ram_gb(),
             "availableRamGb": sys.available_ram_gb(),
             "hasMetal": sys.has_metal,
-            "hasCuda": sys.has_cuda,
             "hasGpu": sys.has_gpu(),
             "isAppleSilicon": sys.is_apple_silicon,
             "memoryTier": tier.to_string(),

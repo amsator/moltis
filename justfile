@@ -5,6 +5,10 @@ default:
 # Keep local formatting/linting toolchain aligned with CI/release workflows.
 nightly_toolchain := "nightly-2025-11-30"
 
+# Some crates (e.g. llama-cpp-sys-2 via bindgen) require a full C toolchain
+# and proper include paths on NixOS. If `shell.nix` exists and `nix-shell` is
+# available, auto-enter it so `just lint/ci/...` works out-of-the-box.
+
 # Format Rust code
 format:
     cargo +{{nightly_toolchain}} fmt --all
@@ -18,11 +22,22 @@ lockfile-check:
     cargo fetch --locked
 
 # Lint Rust code using clippy
-lint: lockfile-check
+lint:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${MOLTIS_NIX_SHELL:-}" ]] && command -v nix-shell >/dev/null 2>&1 && [[ -f shell.nix ]]; then
+        exec env MOLTIS_NIX_SHELL=1 nix-shell --run "just lint"
+    fi
+    cargo fetch --locked
     cargo +{{nightly_toolchain}} clippy -Z unstable-options --workspace --all-features --all-targets --timings -- -D warnings
 
 # Build the project
 build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${MOLTIS_NIX_SHELL:-}" ]] && command -v nix-shell >/dev/null 2>&1 && [[ -f shell.nix ]]; then
+        exec env MOLTIS_NIX_SHELL=1 nix-shell --run "just build"
+    fi
     cargo build
 
 # Build in release mode
@@ -186,10 +201,25 @@ flatpak:
     cd flatpak && flatpak-builder --repo=repo --force-clean builddir org.moltbot.Moltis.yml
 
 # Run all CI checks (format, lint, build, test)
-ci: format-check lint build test
+ci:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${MOLTIS_NIX_SHELL:-}" ]] && command -v nix-shell >/dev/null 2>&1 && [[ -f shell.nix ]]; then
+        exec env MOLTIS_NIX_SHELL=1 nix-shell --run "just ci"
+    fi
+    just format-check
+    just lint
+    just build
+    just test
 
 # Run the same Rust preflight gates used before release packaging.
-release-preflight: lockfile-check
+release-preflight:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${MOLTIS_NIX_SHELL:-}" ]] && command -v nix-shell >/dev/null 2>&1 && [[ -f shell.nix ]]; then
+        exec env MOLTIS_NIX_SHELL=1 nix-shell --run "just release-preflight"
+    fi
+    cargo fetch --locked
     cargo +{{nightly_toolchain}} fmt --all -- --check
     cargo +{{nightly_toolchain}} clippy -Z unstable-options --workspace --all-features --all-targets --timings -- -D warnings
 
@@ -200,7 +230,16 @@ ship commit_message='' pr_title='' pr_body='':
 
 # Run all tests
 test:
-    cargo nextest run --all-features
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${MOLTIS_NIX_SHELL:-}" ]] && command -v nix-shell >/dev/null 2>&1 && [[ -f shell.nix ]]; then
+        exec env MOLTIS_NIX_SHELL=1 nix-shell --run "just test"
+    fi
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        cargo nextest run --all-features
+    else
+        cargo test --workspace --all-features
+    fi
 
 # Install browser tooling for gateway web UI e2e tests.
 ui-e2e-install:

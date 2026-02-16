@@ -4,6 +4,12 @@
 
 ---
 
+# Vision
+
+- [Vision & Philosophy](vision.md)
+
+---
+
 # Getting Started
 
 - [Quickstart](quickstart.md)

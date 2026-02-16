@@ -21,6 +21,25 @@
 
 Inspired by [OpenClaw](https://docs.openclaw.ai) — just build it and run it.
 
+## Vision
+
+Moltis is a **personal AI infrastructure controller** — not another chatbot UI.
+
+| We Don't Build (Red Ocean) | We Build (Blue Ocean) |
+|---------------------------|----------------------|
+| ChatGPT clone with web UI | CLI-agent integrated into terminal (zsh/fish) |
+| "Smart" calendar/email | Infrastructure management agent (NixOS deploy, log monitoring) |
+| RAG over Wikipedia | RAG over personal knowledge base (Obsidian, PDFs, code) |
+| Universal agent | Micro-agent swarm (crypto watcher, server monitor, code reviewer) |
+
+**Core principles:**
+- One binary, zero runtime dependencies (no Node.js, no npm)
+- Personal, not universal — built for power users
+- Infrastructure-first — AI as operations platform, not chat toy
+- Local-first privacy — your data stays on your machine
+
+→ [Full Vision & Philosophy](https://docs.moltis.org/vision.html)
+
 ## Installation
 
 ```bash

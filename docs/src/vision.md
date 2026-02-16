@@ -141,6 +141,13 @@ moltis swarm start \
 
 ## The Road Ahead
 
+### Development Model
+
+```admonish warning title="Local Development Only"
+Moltis is developed locally. No PRs, no upstream contributions.
+This is a personal AI infrastructure controller — we build for ourselves first.
+```
+
 ### Phase 1: Foundation (Current)
 - [x] Multi-provider support (Codex, Copilot, Local LLM)
 - [x] Sandbox execution

@@ -8,6 +8,17 @@ alwaysApply: true
 Rust version of openclaw ([docs](https://docs.openclaw.ai), [code](https://github.com/openclaw/openclaw)).
 All code must have tests with high coverage. Always check for security.
 
+## Development Model
+
+```admonish warning title="Local Development Only"
+This is a personal project. No PRs to upstream, no public contributions.
+All development happens locally. Fork is for backup only.
+```
+
+- **No upstream PRs** — keep changes local
+- **No push to origin** — only local commits
+- **Fork exists** — backup/mirror only, not for collaboration
+
 ## Cargo Features
 
 Enable new feature flags **by default** in `crates/cli/Cargo.toml` (opt-out, not opt-in):
